@@ -1260,6 +1260,11 @@ def make_flashcards(
                 st.session_state.flashcard_chunks = []
                 return [NOT_IN_LECTURES_REASON]
 
+        # Clear the old cards: if this try fails, they must not
+        # stay on screen under the new topic
+        st.session_state.flashcards = []
+        st.session_state.flashcard_chunks = []
+
         try:
 
             cards, reasons = generate_flashcards(
@@ -2034,6 +2039,10 @@ def make_quiz(
                 st.session_state.quiz_submitted = False
                 return [NOT_IN_LECTURES_REASON]
 
+    # Clear the old quiz: if this one fails, the old questions must not
+    # stay on screen under the new topic
+    st.session_state.quiz = []
+    st.session_state.quiz_submitted = False
     st.session_state.quiz_chunks = chunks
     st.session_state.quiz_previous_questions = []
 
