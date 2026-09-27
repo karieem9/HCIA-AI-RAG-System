@@ -358,6 +358,83 @@ def grade_answer(chosen, answer):
 
 
 # =====================================================================
+# 3b) Flashcards (same pattern as the quiz: slides → JSON → check each card)
+# =====================================================================
+FLASHCARD_JSON_FORMAT = """{
+  "cards": [
+    {"front": "...", "back": "...", "source": "one of the slide ids above"}
+  ]
+}"""
+N_FLASHCARDS = 5
+
+
+def build_flashcard_prompt(retrieved_chunks, n_cards=N_FLASHCARDS):
+    slide_parts = []
+    for c in retrieved_chunks:
+        slide_parts.append(f"[slide id: {c['id']}]\n{c['text']}")
+    slides = "\n\n---\n\n".join(slide_parts)
+
+    return f"""You write flashcards to help a student revise an AI / Machine Learning course.
+
+Slides (the ONLY source of content you may use):
+{slides}
+
+Rules:
+1. Write exactly {n_cards} flashcards. Every fact must come from the slides above. No outside knowledge.
+2. "front": a short term or question.
+3. "back": a short, clear answer (1-2 sentences), grounded in the slides.
+4. "source": the slide id the fact comes from, e.g. "K-means_p21" (only the id).
+5. Do not repeat the same fact in two cards.
+
+Return ONLY a JSON object in this format:
+{FLASHCARD_JSON_FORMAT}"""
+
+
+def check_flashcard(card, allowed_ids):
+    """Returns a list of problems. Empty list = the card is valid."""
+    if not isinstance(card, dict):
+        return ["not a JSON object"]
+
+    problems = []
+    for side in ["front", "back"]:
+        if not isinstance(card.get(side), str) or not card.get(side).strip():
+            problems.append(f"empty {side}")
+    if card.get("source") not in allowed_ids:
+        problems.append(f"unknown source: {card.get('source')}")
+    return problems
+
+
+def generate_flashcards(retrieved_chunks, quiz_llm, n_cards=N_FLASHCARDS):
+    """Returns (valid_cards, reasons). reasons = why cards were dropped, shown in the app."""
+    prompt = build_flashcard_prompt(retrieved_chunks, n_cards)
+    response = quiz_llm.invoke(prompt)
+
+    try:
+        data = json.loads(response.content)
+    except json.JSONDecodeError:
+        return [], ["The LLM did not return valid JSON"]
+
+    if not isinstance(data, dict) or not isinstance(data.get("cards"), list):
+        return [], ["The JSON does not contain a 'cards' list"]
+
+    allowed_ids = []
+    for c in retrieved_chunks:
+        allowed_ids.append(c["id"])
+
+    valid_cards = []
+    reasons = []
+    for i, card in enumerate(data["cards"], start=1):
+        if isinstance(card, dict):
+            card["source"] = clean_source(card.get("source"))
+        problems = check_flashcard(card, allowed_ids)
+        if problems:
+            reasons.append(f"Dropped card {i}: {problems}")
+        else:
+            valid_cards.append(card)
+    return valid_cards, reasons
+
+
+# =====================================================================
 # 4) Small UI helpers (HTML pieces styled by assets/style.css)
 # =====================================================================
 def buddy_html():
@@ -474,8 +551,27 @@ def make_new_quiz(res, quiz_llm):
     return []
 
 
-def show_quiz_error(reasons):
-    st.warning("Could not generate a quiz this time. Please click again.")
+def make_new_flashcards(quiz_llm):
+    """Generates flashcards from the saved slides. Returns the reasons if it failed."""
+    with st.spinner("Writing flashcards from these slides..."):
+        try:
+            cards, reasons = generate_flashcards(st.session_state.chunks, quiz_llm)
+        except Exception as e:
+            cards, reasons = [], [f"Flashcard generation failed: {e}"]
+    for reason in reasons:
+        print(reason)      # also in the terminal
+
+    if not cards:
+        return reasons
+
+    st.session_state.flashcards = cards
+    st.session_state.flipped = {}
+    st.session_state.flashcard_round += 1       # new button keys for the new cards
+    return []
+
+
+def show_quiz_error(reasons, what="a quiz"):
+    st.warning(f"Could not generate {what} this time. Please click again.")
     with st.expander("Why? (details)"):
         for reason in reasons:
             st.caption(reason)
@@ -506,6 +602,10 @@ if "question" not in st.session_state:
     st.session_state.timing = {}
 if "previous_questions" not in st.session_state:
     st.session_state.previous_questions = []   # quiz questions already asked on this topic
+if "flashcards" not in st.session_state:
+    st.session_state.flashcards = []           # generated flashcards
+    st.session_state.flipped = {}              # card index → True when the answer is shown
+    st.session_state.flashcard_round = 0       # new number for every set of cards → fresh button keys
 
 if not os.getenv("OPENAI_API_KEY"):
     st.error("OPENAI_API_KEY was not found. Put it in a `.env` file next to app.py, then restart the app.")
@@ -578,6 +678,8 @@ if new_question:
         st.session_state.chunks = chunks
         st.session_state.quiz = []
         st.session_state.previous_questions = []     # new topic → start fresh
+        st.session_state.flashcards = []
+        st.session_state.flipped = {}
         st.session_state.submitted = False
         st.session_state.chosen = {}
         st.session_state.timing = {"search": t1 - t0, "answer": t2 - t1}
@@ -612,15 +714,28 @@ if st.session_state.question is not None:
                 show_sources(st.session_state.chunks)       # the closest slides were not used → don't show them
 
         if not_found:
-            # No quiz: the quiz would come from slides that are not about this question
-            st.info("This topic is not in the lectures, so there is no quiz for it. Ask about a topic from the course.")
-        elif not st.session_state.quiz:
-            if st.button("📝 Quiz me on this", type="primary"):
-                reasons = make_new_quiz(res, quiz_llm)
-                if reasons:
-                    show_quiz_error(reasons)
-                else:
-                    st.rerun()
+            # No quiz or flashcards: they would come from slides that are not about this question
+            st.info("This topic is not in the lectures, so there is no quiz or flashcards for it. "
+                    "Ask about a topic from the course.")
+        else:
+            # Each button stays until it is used, so the student can do both on the same topic
+            quiz_col, cards_col, _ = st.columns([1, 1, 1.4])
+            quiz_reasons = []
+            card_reasons = []
+            if not st.session_state.quiz:
+                if quiz_col.button("📝 Quiz me on this", type="primary"):
+                    quiz_reasons = make_new_quiz(res, quiz_llm)
+                    if not quiz_reasons:
+                        st.rerun()
+            if not st.session_state.flashcards:
+                if cards_col.button("🗂️ Flashcards on this"):
+                    card_reasons = make_new_flashcards(quiz_llm)
+                    if not card_reasons:
+                        st.rerun()
+            if quiz_reasons:
+                show_quiz_error(quiz_reasons)
+            if card_reasons:
+                show_quiz_error(card_reasons, "flashcards")
 
         # ---------------- Quiz ----------------
         if st.session_state.quiz and not st.session_state.submitted:
@@ -695,6 +810,30 @@ if st.session_state.question is not None:
                 reasons = make_new_quiz(res, quiz_llm)
                 if reasons:
                     show_quiz_error(reasons)
+                else:
+                    st.rerun()
+
+        # ---------------- Flashcards ----------------
+        if st.session_state.flashcards:
+            st.markdown("#### 🗂️ Flashcards")
+            for i, card in enumerate(st.session_state.flashcards):
+                key = f"c{st.session_state.flashcard_round}_{i}"
+                with st.container(border=True):
+                    st.markdown(f"**{card['front']}**")
+                    if st.session_state.flipped.get(i):
+                        st.caption(card["back"])
+                        if st.button("Hide answer", key=f"hide_{key}"):
+                            st.session_state.flipped[i] = False
+                            st.rerun()
+                    else:
+                        if st.button("Show answer", key=f"show_{key}"):
+                            st.session_state.flipped[i] = True
+                            st.rerun()
+
+            if st.button("🔄 New flashcards on this topic"):
+                reasons = make_new_flashcards(quiz_llm)
+                if reasons:
+                    show_quiz_error(reasons, "flashcards")
                 else:
                     st.rerun()
 
