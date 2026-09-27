@@ -61,14 +61,14 @@ Steps 1–4 run **once** in the notebook. Steps 5–8 run **every time** the stu
   - `Linear_Regression-1 2.pdf`: 79 pages of images, 0 characters of text (the text version is kept).
 - 6 lectures have 19–40% screenshot pages with no readable text: a known limitation.
 - Both decision tree files are kept: the small one has 11 new pages; the repeated pages are removed in step 3.
-- Both removed files are in `excluded/`.
+- The notebook expects the lecture PDFs in `lectures/` and the 2 removed files in `excluded/` (see Setup).
 
 ### Preprocessing
 
 - `fix_spaced_letters`: pypdf sometimes splits words into letters (`Q U A N T I Z E D` → `QUANTIZED`).
 - Skip pages with fewer than 30 characters (empty or title-only) and exact duplicate pages.
 - **1,015 pages → 887 chunks** (100 empty, 28 duplicates removed).
-- **One slide = one chunk.** We first tried agentic chunking (the LLM decides where a chunk ends): it lost the page numbers and needed one LLM call per paragraph. The experiment is in the notebook appendix (`agentic_chunks.json`).
+- **One slide = one chunk.** We first tried agentic chunking (the LLM decides where a chunk ends): it lost the page numbers and needed one LLM call per paragraph. The experiment is in the notebook appendix.
 - The lecture name is added at the start of every chunk (`[K-means]\n...`), because many slides never say their topic.
 - The longest chunk is 370 tokens (average 96), under the 512-token limit of the embedding model, so no chunk is cut.
 
@@ -144,6 +144,8 @@ The first start takes ~10 seconds (loading PyTorch and the embedding model; the 
 The notebook is **not** needed to run the app: `rag_db/` and `question_bank.json` are already in the repo.
 Run `Study_Assistant_Pipeline.ipynb` only to rebuild the index or re-run the evaluations.
 
+The lecture PDFs are NTI course material, so they are not in this repo. To run the notebook from the start, put the 22 lecture PDFs in `lectures/` and the 2 removed PDFs in `excluded/`.
+
 ### Dependencies
 
 See `requirements.txt`. Main ones: `streamlit`, `chromadb` (must stay on the pinned version: `rag_db/` was built with it), `sentence-transformers`, `torch`, `scikit-learn`, `langchain-openai`, `python-dotenv`. Notebook only: `pypdf`, `python-docx`, `pandas`, `matplotlib`.
@@ -168,9 +170,8 @@ ChromaDB touches the files in `rag_db/` every time the app or the notebook opens
 ├── question_bank.json              130 exam questions (100 single, 30 multiple)
 ├── question_bank.docx / question_bank_answer_key.docx
 ├── bank_eval_results.json          results of evaluation 2
-├── agentic_chunks.json             agentic chunking experiment (not used)
-├── lectures/                       22 lecture PDFs
-├── excluded/                       2 removed PDFs
+├── lectures/  (not in the repo)    22 lecture PDFs, for the notebook only
+├── excluded/  (not in the repo)    2 removed PDFs, for the notebook only
 ├── assets/                         CSS, images, evaluation charts
 └── .streamlit/config.toml
 ```
