@@ -6,7 +6,7 @@ Then test yourself with an exam-style quiz, or revise with flashcards.
 
 NTI AI graduation project · Kareem · Basmala · Youssif
 
-![Explain page: the answer cites KNN p.53 and Feature Scaling p.15, then related concepts and the quiz / flashcards buttons](assets/screenshot_explain.png)
+![Home screen of the Study Assistant: ask a question about any lecture, or try one of the example questions](assets/screenshot_home.png)
 
 ---
 
@@ -32,6 +32,8 @@ Under every answer:
 - **Concept Map**: every topic asked in the session and its related concepts, in one graph.
 
 A topic that is not in the lectures gets no quiz and no flashcards.
+
+![Explain page: the answer cites KNN p.53 and Feature Scaling p.15, then related concepts and the quiz / flashcards buttons](assets/screenshot_explain.png)
 
 ---
 
