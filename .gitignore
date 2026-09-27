@@ -5,7 +5,3 @@ __pycache__/
 venv/
 .venv/
 *.py[cod]
-
-# Course PDFs (NTI copyright): keep them locally, only the notebook needs them
-lectures/
-excluded/
