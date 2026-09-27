@@ -1,2 +1,7 @@
 /.env
 /CLAUDE.md
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.env
