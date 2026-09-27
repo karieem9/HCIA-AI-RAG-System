@@ -2,7 +2,11 @@
 HCIA-AI Study Assistant (Streamlit app).
 
 The notebook builds everything (rag_db/ and question_bank.json). This app only READS them.
-Flow:  question → hybrid search → grounded explanation → "Quiz me on this" → graded quiz
+
+Modes:
+    1. Explain Topic
+    2. Quiz
+    3. Flashcards
 
 Run from a terminal in this folder:
     python -m streamlit run app.py
@@ -25,8 +29,12 @@ from sentence_transformers import SentenceTransformer
 from sklearn.feature_extraction.text import TfidfVectorizer
 from langchain_openai import ChatOpenAI
 
-# ---------- Paths + settings (must match the notebook) ----------
-BASE_DIR = Path(__file__).parent          # folder of app.py, not the terminal's folder
+
+# =====================================================================
+# Paths + settings
+# =====================================================================
+
+BASE_DIR = Path(__file__).parent
 DB_PATH = BASE_DIR / "rag_db"
 BANK_JSON = BASE_DIR / "question_bank.json"
 ASSETS_DIR = BASE_DIR / "assets"
@@ -34,9 +42,19 @@ ASSETS_DIR = BASE_DIR / "assets"
 COLLECTION_NAME = "lectures"
 MODEL_NAME = "BAAI/bge-small-en-v1.5"
 LLM_NAME = "gpt-4o-mini"
+
 ALPHA = 0.5
 TOP_K = 3
 N_QUIZ_QUESTIONS = 3
+
+# Quiz page settings
+QUIZ_TOP_K = 5
+QUIZ_MAX_COUNT = 10
+
+# Flashcard settings
+FLASHCARD_TOP_K = 6
+FLASHCARD_MAX_COUNT = 30
+FLASHCARD_DEFAULT_COUNT = 10
 
 EXAMPLE_QUESTIONS = [
     "What is QLoRA?",
@@ -44,36 +62,72 @@ EXAMPLE_QUESTIONS = [
     "Why do we scale features before KNN?",
 ]
 
-st.set_page_config(page_title="HCIA-AI Study Assistant", page_icon="📘", layout="wide")
+
+st.set_page_config(
+    page_title="HCIA-AI Study Assistant",
+    page_icon="📘",
+    layout="wide",
+)
+
 load_dotenv(BASE_DIR / ".env", override=True)
 
 
 # =====================================================================
-# 1) Load everything ONCE (Streamlit re-runs this file on every click)
+# 1) Load everything ONCE
 # =====================================================================
+
 @st.cache_resource(show_spinner="Loading the lectures index...")
 def load_resources():
     try:
-        # From the local cache (the notebook already downloaded it): no internet check → fast, works offline
-        dense_model = SentenceTransformer(MODEL_NAME, local_files_only=True)
+        # Use local model cache first
+        dense_model = SentenceTransformer(
+            MODEL_NAME,
+            local_files_only=True
+        )
     except OSError:
-        # Not in the cache yet (first run on a new computer) → download it once
+        # Download only if model is not already cached
         dense_model = SentenceTransformer(MODEL_NAME)
 
     client = chromadb.PersistentClient(path=str(DB_PATH))
-    collection = client.get_collection(name=COLLECTION_NAME, embedding_function=None)
-    stored = collection.get(include=["documents", "metadatas"])
 
-    # TF-IDF is fit on the stored chunks only (the query is only transformed)
-    tfidf = TfidfVectorizer(lowercase=True, stop_words="english")
-    sparse_vectors = tfidf.fit_transform(stored["documents"])
+    collection = client.get_collection(
+        name=COLLECTION_NAME,
+        embedding_function=None
+    )
+
+    stored = collection.get(
+        include=["documents", "metadatas"]
+    )
+
+    # ---------------------------------------------------------------
+    # TF-IDF for sparse retrieval
+    # ---------------------------------------------------------------
+
+    tfidf = TfidfVectorizer(
+        lowercase=True,
+        stop_words="english"
+    )
+
+    sparse_vectors = tfidf.fit_transform(
+        stored["documents"]
+    )
+
+    # ---------------------------------------------------------------
+    # Question bank
+    # ---------------------------------------------------------------
 
     with open(BANK_JSON, encoding="utf-8") as f:
         bank = json.load(f)
+
     bank_texts = []
+
     for q in bank:
         bank_texts.append(q["question"])
-    bank_vectors = dense_model.encode(bank_texts, normalize_embeddings=True)
+
+    bank_vectors = dense_model.encode(
+        bank_texts,
+        normalize_embeddings=True
+    )
 
     return {
         "dense_model": dense_model,
@@ -90,44 +144,115 @@ def load_resources():
 
 @st.cache_resource
 def load_llms():
-    explain_llm = ChatOpenAI(model=LLM_NAME, temperature=0)
-    quiz_llm = ChatOpenAI(model=LLM_NAME, temperature=0.7).bind(response_format={"type": "json_object"})
-    return explain_llm, quiz_llm
+
+    explain_llm = ChatOpenAI(
+        model=LLM_NAME,
+        temperature=0
+    )
+
+    quiz_llm = ChatOpenAI(
+        model=LLM_NAME,
+        temperature=0.7
+    ).bind(
+        response_format={"type": "json_object"}
+    )
+
+    flashcard_llm = ChatOpenAI(
+        model=LLM_NAME,
+        temperature=0.4
+    ).bind(
+        response_format={"type": "json_object"}
+    )
+
+    related_llm = ChatOpenAI(
+        model=LLM_NAME,
+        temperature=0.3
+    ).bind(
+        response_format={"type": "json_object"}
+    )
+
+    return explain_llm, quiz_llm, flashcard_llm, related_llm
 
 
 # =====================================================================
-# 2) Retrieval + explanation (same logic as notebook Sections 5 and 6)
+# 2) Retrieval + explanation
 # =====================================================================
+
 def min_max(scores):
+
     if scores.max() == scores.min():
         return np.zeros_like(scores)
-    return (scores - scores.min()) / (scores.max() - scores.min())
+
+    return (
+        (scores - scores.min())
+        / (scores.max() - scores.min())
+    )
 
 
-def hybrid_search(query, res, alpha=ALPHA, top_k=TOP_K):
-    query_dense = res["dense_model"].encode([query], normalize_embeddings=True)
+def hybrid_search(
+    query,
+    res,
+    alpha=ALPHA,
+    top_k=TOP_K
+):
+
+    query_dense = res["dense_model"].encode(
+        [query],
+        normalize_embeddings=True
+    )
+
     query_sparse = res["tfidf"].transform([query])
 
-    # 1) Dense scores from ChromaDB (cosine distance → similarity)
+    # ---------------------------------------------------------------
+    # Dense scores
+    # ---------------------------------------------------------------
+
     results = res["collection"].query(
         query_embeddings=query_dense.tolist(),
         n_results=res["collection"].count(),
         include=["distances"],
     )
+
     dense_by_id = {}
-    for chunk_id, distance in zip(results["ids"][0], results["distances"][0]):
+
+    for chunk_id, distance in zip(
+        results["ids"][0],
+        results["distances"][0]
+    ):
         dense_by_id[chunk_id] = 1 - distance
-    dense_scores = np.array([dense_by_id[chunk_id] for chunk_id in res["stored_ids"]])
 
-    # 2) Sparse scores from TF-IDF
-    sparse_scores = (res["sparse_vectors"] @ query_sparse.T).toarray().ravel()
+    dense_scores = np.array(
+        [
+            dense_by_id[chunk_id]
+            for chunk_id in res["stored_ids"]
+        ]
+    )
 
-    # 3) Normalize + combine, 4) top results
-    hybrid_scores = alpha * min_max(dense_scores) + (1 - alpha) * min_max(sparse_scores)
-    top_positions = np.argsort(hybrid_scores)[::-1][:top_k]
+    # ---------------------------------------------------------------
+    # Sparse scores
+    # ---------------------------------------------------------------
+
+    sparse_scores = (
+        res["sparse_vectors"] @ query_sparse.T
+    ).toarray().ravel()
+
+    # ---------------------------------------------------------------
+    # Combine
+    # ---------------------------------------------------------------
+
+    hybrid_scores = (
+        alpha * min_max(dense_scores)
+        + (1 - alpha) * min_max(sparse_scores)
+    )
+
+    top_positions = np.argsort(
+        hybrid_scores
+    )[::-1][:top_k]
 
     top_chunks = []
+
     for pos in top_positions:
+
         top_chunks.append({
             "id": res["stored_ids"][pos],
             "lecture": res["stored_metas"][pos]["lecture"],
@@ -135,6 +260,7 @@ def hybrid_search(query, res, alpha=ALPHA, top_k=TOP_K):
             "text": res["stored_docs"][pos],
             "score": float(hybrid_scores[pos]),
         })
+
     return top_chunks
 
 
@@ -142,19 +268,59 @@ NOT_FOUND_ANSWER = "I don't know based on the lectures."
 
 
 def is_not_in_lectures(answer):
-    # The prompt tells the LLM to reply with exactly NOT_FOUND_ANSWER when nothing in the slides is related.
-    # startswith (not "in"): a partial answer that only mentions the sentence at the end still gets a quiz.
-    text = answer.strip().lower().replace("’", "'")      # the LLM sometimes uses a curly apostrophe
-    return text.startswith(NOT_FOUND_ANSWER.lower().rstrip("."))
+
+    text = (
+        answer
+        .strip()
+        .lower()
+        .replace("’", "'")
+    )
+
+    return text.startswith(
+        NOT_FOUND_ANSWER.lower().rstrip(".")
+    )
 
 
-def build_prompt(query, retrieved_chunks):
+NOT_IN_LECTURES_REASON = "This topic is not in the lectures."
+
+
+def topic_in_lectures(
+    topic,
+    retrieved_chunks,
+    explain_llm
+):
+    # Same check as the Explain page: ask for the grounded explanation and
+    # see if the LLM says "I don't know based on the lectures."
+    answer = explain_llm.invoke(
+        build_prompt(
+            topic,
+            retrieved_chunks
+        )
+    ).content
+
+    return not is_not_in_lectures(answer)
+
+
+def build_prompt(
+    query,
+    retrieved_chunks
+):
+
     context_parts = []
+
     for c in retrieved_chunks:
-        context_parts.append(f"[{c['lecture']} p.{c['page']}]\n{c['text']}")
-    context = "\n\n---\n\n".join(context_parts)
+
+        context_parts.append(
+            f"[{c['lecture']} p.{c['page']}]\n"
+            f"{c['text']}"
+        )
+
+    context = "\n\n---\n\n".join(
+        context_parts
+    )
 
     return f"""You are a helpful tutor helping a student study an AI / Machine Learning course.
+
 The context below contains the lecture slides most relevant to the question.
 
 How to answer:
@@ -174,14 +340,250 @@ Answer:"""
 
 
 # =====================================================================
-# 3) Quiz (same logic as notebook Section 7)
+# 2b) Related concepts ("You may also want to learn")
 # =====================================================================
+
+RELATED_CONCEPTS_JSON_FORMAT = """{
+  "concepts": ["...", "...", "..."]
+}"""
+
+MAX_RELATED_CONCEPTS = 5
+
+
+def build_related_concepts_prompt(
+    topic,
+    retrieved_chunks
+):
+
+    slide_parts = []
+
+    for c in retrieved_chunks:
+
+        slide_parts.append(
+            f"[{c['lecture']} p.{c['page']}]\n"
+            f"{c['text']}"
+        )
+
+    slides = "\n\n---\n\n".join(
+        slide_parts
+    )
+
+    return f"""You help a student decide what to study next in an AI / Machine Learning course.
+
+The student just asked about:
+{topic}
+
+These are the lecture slides used to answer that question:
+{slides}
+
+Using ONLY these slides, list up to {MAX_RELATED_CONCEPTS} other concepts, terms,
+or techniques that are mentioned or clearly implied in them, and that a student
+would naturally want to learn about next.
+
+Rules:
+1. Do NOT repeat "{topic}" itself, or reword it.
+2. Do NOT invent a concept that is not in the slides above.
+3. Each concept is a short name (2-4 words), not a sentence, not a question.
+4. If the slides genuinely do not suggest any other concept, return fewer items,
+   or an empty list.
+
+Return ONLY a JSON object in this format:
+
+{RELATED_CONCEPTS_JSON_FORMAT}"""
+
+
+def check_related_concept(
+    concept,
+    topic
+):
+
+    if not isinstance(concept, str):
+        return False
+
+    concept = concept.strip()
+
+    if not concept or len(concept) > 60:
+        return False
+
+    if concept.lower() == topic.strip().lower():
+        return False
+
+    return True
+
+
+def get_related_concepts(
+    topic,
+    retrieved_chunks,
+    related_llm,
+    n=MAX_RELATED_CONCEPTS
+):
+
+    prompt = build_related_concepts_prompt(
+        topic,
+        retrieved_chunks
+    )
+
+    response = related_llm.invoke(prompt)
+
+    try:
+
+        data = json.loads(
+            response.content
+        )
+
+    except json.JSONDecodeError:
+
+        return []
+
+    raw_concepts = (
+        data.get("concepts")
+        if isinstance(data, dict)
+        else None
+    )
+
+    if not isinstance(raw_concepts, list):
+        return []
+
+    seen = set()
+    concepts = []
+
+    for raw in raw_concepts:
+
+        if not check_related_concept(
+            raw,
+            topic
+        ):
+            continue
+
+        cleaned = raw.strip()
+        key = cleaned.lower()
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        concepts.append(cleaned)
+
+        if len(concepts) >= n:
+            break
+
+    return concepts
+
+
+# =====================================================================
+# 2c) Explain flow (search + answer + related concepts)
+# =====================================================================
+
+def answer_question(
+    question,
+    res,
+    explain_llm,
+    related_llm
+):
+    """
+    Runs the full Explain Topic flow for `question`: hybrid search,
+    grounded explanation, and (if the topic was found in the lectures)
+    related concepts. Updates st.session_state and returns True on
+    success, False if the LLM call failed (an error is already shown
+    to the user in that case).
+    """
+
+    with st.spinner(
+        "Searching the slides and writing the explanation..."
+    ):
+
+        t0 = time.time()
+
+        chunks = hybrid_search(
+            question,
+            res
+        )
+
+        t1 = time.time()
+
+        try:
+
+            answer = explain_llm.invoke(
+                build_prompt(
+                    question,
+                    chunks
+                )
+            ).content
+
+        except Exception as e:
+
+            st.error(
+                f"The LLM call failed: {e}"
+            )
+
+            return False
+
+        t2 = time.time()
+
+        related_concepts = []
+
+        if not is_not_in_lectures(answer):
+
+            try:
+
+                related_concepts = get_related_concepts(
+                    question,
+                    chunks,
+                    related_llm
+                )
+
+            except Exception:
+
+                # Related concepts are a bonus feature: never break
+                # the explain flow if this call fails.
+                related_concepts = []
+
+        t3 = time.time()
+
+    st.session_state.question = question
+    st.session_state.answer = answer
+    st.session_state.chunks = chunks
+    st.session_state.related_concepts = related_concepts
+
+    st.session_state.timing = {
+        "search": t1 - t0,
+        "answer": t2 - t1,
+        "related": t3 - t2
+    }
+
+    # ---- session-wide concept map: remember topic -> concept edges ----
+
+    for concept in related_concepts:
+
+        edge = (question, concept)
+
+        if edge not in st.session_state.concept_edges:
+
+            st.session_state.concept_edges.append(edge)
+
+    # Keep the map readable: only remember the most recent edges.
+    st.session_state.concept_edges = (
+        st.session_state.concept_edges[-40:]
+    )
+
+    return True
+
+
+# =====================================================================
+# 3) Quiz
+# =====================================================================
+
 QUIZ_JSON_FORMAT = """{
   "questions": [
     {
       "type": "single",
       "question": "...",
-      "options": {"A": "...", "B": "...", "C": "...", "D": "..."},
+      "options": {
+        "A": "...",
+        "B": "...",
+        "C": "...",
+        "D": "..."
+      },
       "answer": ["B"],
       "explanation": "...",
       "source": "one of the slide ids above"
@@ -190,41 +592,98 @@ QUIZ_JSON_FORMAT = """{
 }"""
 
 
-def get_style_examples(topic, res, n=3):
-    topic_vector = res["dense_model"].encode([topic], normalize_embeddings=True)[0]
-    similarities = res["bank_vectors"] @ topic_vector
-    top_positions = np.argsort(similarities)[::-1][:n]
+def get_style_examples(
+    topic,
+    res,
+    n=3
+):
+
+    topic_vector = res["dense_model"].encode(
+        [topic],
+        normalize_embeddings=True
+    )[0]
+
+    similarities = (
+        res["bank_vectors"] @ topic_vector
+    )
+
+    top_positions = np.argsort(
+        similarities
+    )[::-1][:n]
 
     examples = []
+
     for pos in top_positions:
-        examples.append(res["bank"][pos])
+        examples.append(
+            res["bank"][pos]
+        )
+
     return examples
 
 
-def build_quiz_prompt(retrieved_chunks, style_examples, n_questions=N_QUIZ_QUESTIONS, avoid_questions=None):
+def build_quiz_prompt(
+    retrieved_chunks,
+    style_examples,
+    n_questions=N_QUIZ_QUESTIONS,
+    avoid_questions=None
+):
+
     slide_parts = []
+
     for c in retrieved_chunks:
-        slide_parts.append(f"[slide id: {c['id']}]\n{c['text']}")
-    slides = "\n\n---\n\n".join(slide_parts)
+
+        slide_parts.append(
+            f"[slide id: {c['id']}]\n"
+            f"{c['text']}"
+        )
+
+    slides = "\n\n---\n\n".join(
+        slide_parts
+    )
 
     example_parts = []
-    for q in style_examples:
-        lines = [f"({q['type']}) {q['question']}"]
-        for letter, option_text in q["options"].items():
-            lines.append(f"{letter}. {option_text}")
-        example_parts.append("\n".join(lines))
-    examples = "\n\n".join(example_parts)
 
-    # 3) Questions the student already got on this topic → ask for new ones
+    for q in style_examples:
+
+        lines = [
+            f"({q['type']}) {q['question']}"
+        ]
+
+        for letter, option_text in q["options"].items():
+
+            lines.append(
+                f"{letter}. {option_text}"
+            )
+
+        example_parts.append(
+            "\n".join(lines)
+        )
+
+    examples = "\n\n".join(
+        example_parts
+    )
+
     avoid_text = ""
+
     if avoid_questions:
+
         avoid_lines = []
+
         for old_question in avoid_questions:
-            avoid_lines.append(f"- {old_question}")
-        avoid_text = ("The student already answered these questions. Write NEW questions that test "
-                      "different facts or ideas from the slides, not the same ones reworded. "
-                      "This includes the multiple-choice question: build it from different facts too:\n"
-                      + "\n".join(avoid_lines) + "\n")
+
+            avoid_lines.append(
+                f"- {old_question}"
+            )
+
+        avoid_text = (
+            "The student already answered these questions. "
+            "Write NEW questions that test different facts "
+            "or ideas from the slides, not the same ones reworded. "
+            "This includes the multiple-choice question: build it "
+            "from different facts too:\n"
+            + "\n".join(avoid_lines)
+            + "\n"
+        )
 
     return f"""You write multiple-choice exam questions to help a student revise an AI / Machine Learning course.
 
@@ -238,460 +697,2432 @@ Rules:
 1. Write exactly {n_questions} questions. Every question and every correct answer must come from the slides above. No outside knowledge.
 2. Each question has exactly 4 options: A, B, C, D. Wrong options must be plausible but clearly wrong according to the slides.
 3. "type" is "single" (exactly 1 correct letter) or "multiple" (2 or 3 correct letters, "select all that apply").
-   At least 1 question must be "multiple".
-4. "answer" is always a list of letters, e.g. ["B"] or ["A", "C"].
-5. "explanation": 1-2 sentences explaining the correct answer using the slides.
-6. "source": the slide id the answer comes from, e.g. "K-means_p21" (only the id: no brackets, no "slide id:").
+4. At least 1 question must be "multiple".
+5. "answer" is always a list of letters, e.g. ["B"] or ["A", "C"].
+6. "explanation": 1-2 sentences explaining the correct answer using the slides.
+7. "source": the slide id the answer comes from.
 
 {avoid_text}
+
 Return ONLY a JSON object in this format:
+
 {QUIZ_JSON_FORMAT}"""
 
 
 def clean_source(source):
-    # The LLM sometimes copies the whole label: "[slide id: KNN_p14]" → "KNN_p14"
+
     if not isinstance(source, str):
         return source
+
     source = source.strip()
     source = source.strip("[]")
-    source = source.replace("slide id:", "")
+    source = source.replace(
+        "slide id:",
+        ""
+    )
+
     return source.strip()
 
 
-def check_question(q, allowed_ids):
-    """Returns a list of problems. Empty list = the question is valid."""
+def check_question(
+    q,
+    allowed_ids
+):
+
     if not isinstance(q, dict):
         return ["not a JSON object"]
 
     problems = []
 
     q_type = q.get("type")
-    if q_type not in ["single", "multiple"]:
-        problems.append(f"bad type: {q_type}")
+
+    if q_type not in [
+        "single",
+        "multiple"
+    ]:
+        problems.append(
+            f"bad type: {q_type}"
+        )
 
     if not q.get("question"):
-        problems.append("empty question")
+        problems.append(
+            "empty question"
+        )
 
     options = q.get("options")
+
     if not isinstance(options, dict):
         options = {}
-    if sorted(options.keys()) != ["A", "B", "C", "D"]:
-        problems.append("options must be exactly A, B, C, D")
+
+    if sorted(options.keys()) != [
+        "A",
+        "B",
+        "C",
+        "D"
+    ]:
+        problems.append(
+            "options must be exactly A, B, C, D"
+        )
+
+    for letter, option_text in options.items():
+
+        if not isinstance(option_text, str) or not option_text.strip():
+
+            problems.append(
+                f"option {letter} must be non-empty text"
+            )
+
+    # The explanation is shown after Submit: a missing one would crash the page
+    if not isinstance(q.get("explanation"), str) or not q.get("explanation").strip():
+
+        problems.append(
+            "empty explanation"
+        )
 
     answer = q.get("answer")
+
     if not isinstance(answer, list) or len(answer) == 0:
-        problems.append("answer must be a non-empty list")
+
+        problems.append(
+            "answer must be a non-empty list"
+        )
+
         answer = []
 
     seen_letters = []
+
     for letter in answer:
-        if not isinstance(letter, str) or letter not in options:
-            problems.append(f"answer letter {letter} is not an option")
+
+        if (
+            not isinstance(letter, str)
+            or letter not in options
+        ):
+            problems.append(
+                f"answer letter {letter} is not an option"
+            )
+
         elif letter in seen_letters:
-            problems.append(f"answer letter {letter} is repeated")
+
+            problems.append(
+                f"answer letter {letter} is repeated"
+            )
+
         seen_letters.append(letter)
 
-    if q_type == "single" and len(answer) != 1:
-        problems.append("single question must have exactly 1 answer")
-    if q_type == "multiple" and len(answer) < 2:
-        problems.append("multiple question must have 2+ answers")
+    if (
+        q_type == "single"
+        and len(answer) != 1
+    ):
+        problems.append(
+            "single question must have exactly 1 answer"
+        )
+
+    if (
+        q_type == "multiple"
+        and len(answer) < 2
+    ):
+        problems.append(
+            "multiple question must have 2+ answers"
+        )
 
     if q.get("source") not in allowed_ids:
-        problems.append(f"unknown source: {q.get('source')}")
+
+        problems.append(
+            f"unknown source: {q.get('source')}"
+        )
 
     return problems
 
 
-def is_repeat(question, old_questions):
-    # "almost the same text": 80%+ of the characters match (difflib = Python standard library).
-    # Tested: rewordings of one question score 0.89-0.97, different questions 0.31-0.50.
+def is_repeat(
+    question,
+    old_questions
+):
+
     for old in old_questions:
-        ratio = difflib.SequenceMatcher(None, question.lower(), old.lower()).ratio()
+
+        ratio = difflib.SequenceMatcher(
+            None,
+            question.lower(),
+            old.lower()
+        ).ratio()
+
         if ratio > 0.8:
             return True
+
     return False
 
 
-def generate_quiz(query, retrieved_chunks, res, quiz_llm, avoid_questions=None):
-    """Returns (valid_questions, reasons). reasons = why questions were dropped, shown in the app."""
-    style_examples = get_style_examples(query, res)
-    prompt = build_quiz_prompt(retrieved_chunks, style_examples, avoid_questions=avoid_questions)
+def generate_quiz(
+    query,
+    retrieved_chunks,
+    res,
+    quiz_llm,
+    n_questions=N_QUIZ_QUESTIONS,
+    avoid_questions=None
+):
+
+    style_examples = get_style_examples(
+        query,
+        res
+    )
+
+    prompt = build_quiz_prompt(
+        retrieved_chunks,
+        style_examples,
+        n_questions=n_questions,
+        avoid_questions=avoid_questions
+    )
+
     response = quiz_llm.invoke(prompt)
 
     try:
-        data = json.loads(response.content)
+
+        data = json.loads(
+            response.content
+        )
+
     except json.JSONDecodeError:
-        return [], ["The LLM did not return valid JSON"]
 
-    if not isinstance(data, dict) or not isinstance(data.get("questions"), list):
-        return [], ["The JSON does not contain a 'questions' list"]
+        return [], [
+            "The LLM did not return valid JSON"
+        ]
 
-    allowed_ids = []
-    for c in retrieved_chunks:
-        allowed_ids.append(c["id"])
+    if (
+        not isinstance(data, dict)
+        or not isinstance(
+            data.get("questions"),
+            list
+        )
+    ):
+
+        return [], [
+            "The JSON does not contain a 'questions' list"
+        ]
+
+    allowed_ids = [
+        c["id"]
+        for c in retrieved_chunks
+    ]
 
     valid_questions = []
     reasons = []
-    for i, q in enumerate(data["questions"], start=1):
+
+    for i, q in enumerate(
+        data["questions"],
+        start=1
+    ):
+
         if isinstance(q, dict):
-            q["source"] = clean_source(q.get("source"))
-        problems = check_question(q, allowed_ids)
-        if not problems and avoid_questions and is_repeat(q["question"], avoid_questions):
-            problems = ["repeats a question from the last quiz"]
+
+            q["source"] = clean_source(
+                q.get("source")
+            )
+
+        problems = check_question(
+            q,
+            allowed_ids
+        )
+
+        if (
+            not problems
+            and avoid_questions
+            and is_repeat(
+                q["question"],
+                avoid_questions
+            )
+        ):
+            problems = [
+                "repeats a question from the last quiz"
+            ]
+
         if problems:
-            reasons.append(f"Dropped question {i}: {problems}")
+
+            reasons.append(
+                f"Dropped question {i}: {problems}"
+            )
+
         else:
+
             valid_questions.append(q)
+
     return valid_questions, reasons
 
 
-def grade_answer(chosen, answer):
+def grade_answer(
+    chosen,
+    answer
+):
+
     return set(chosen) == set(answer)
 
 
 # =====================================================================
-# 4) Small UI helpers (HTML pieces styled by assets/style.css)
+# 4) FLASHCARDS
 # =====================================================================
+
+FLASHCARD_JSON_FORMAT = """{
+  "flashcards": [
+    {
+      "point": "...",
+      "source": "one of the slide ids above",
+      "importance": "high"
+    }
+  ]
+}"""
+
+
+def build_flashcard_prompt(
+    topic,
+    retrieved_chunks,
+    n_cards,
+    difficulty,
+    focus,
+    include_formulas,
+    include_examples
+):
+
+    slide_parts = []
+
+    for c in retrieved_chunks:
+
+        slide_parts.append(
+            f"[slide id: {c['id']} | "
+            f"{c['lecture']} p.{c['page']}]\n"
+            f"{c['text']}"
+        )
+
+    slides = "\n\n---\n\n".join(
+        slide_parts
+    )
+
+    formula_rule = (
+        "Include important formulas when they appear in the slides."
+        if include_formulas
+        else "Do NOT include formula-based points."
+    )
+
+    example_rule = (
+        "Include important examples when they appear in the slides."
+        if include_examples
+        else "Do NOT include example-based points."
+    )
+
+    return f"""You are creating study flashcards for an AI / Machine Learning student.
+
+The student wants flashcards about this topic:
+
+TOPIC:
+{topic}
+
+The slides below are the ONLY source of information.
+
+SLIDES:
+{slides}
+
+FLASHCARD SETTINGS:
+
+Number of cards:
+{n_cards}
+
+Difficulty:
+{difficulty}
+
+Information focus:
+{focus}
+
+Formula setting:
+{formula_rule}
+
+Example setting:
+{example_rule}
+
+IMPORTANT RULES:
+
+1. Create exactly {n_cards} flashcards.
+2. Each flashcard is NOT a question-and-answer pair. It is a single,
+   self-contained piece of important information written as a clear,
+   direct statement (a fact, a definition, a key principle, a step, a
+   comparison, or a relationship) that the student should remember.
+3. Use ONLY information explicitly contained in the provided slides.
+4. Do NOT add outside knowledge.
+5. Do NOT invent facts, formulas, examples, definitions, or explanations.
+6. Prioritize important information such as:
+   - definitions
+   - key concepts
+   - important principles
+   - steps or processes
+   - comparisons
+   - relationships
+   - formulas when allowed
+   - important examples when allowed
+7. Each flashcard should cover ONE main idea, written concisely
+   (roughly 1-3 sentences).
+8. Keep the wording clear and suitable for the selected difficulty.
+9. Each flashcard MUST have a valid source slide id from the provided slides.
+10. "importance" must be either "high" or "medium".
+11. Avoid generating duplicate or almost-identical points.
+12. Return ONLY JSON.
+
+JSON FORMAT:
+
+{FLASHCARD_JSON_FORMAT}
+"""
+
+
+def check_flashcard(
+    card,
+    allowed_ids
+):
+
+    if not isinstance(card, dict):
+        return [
+            "not a JSON object"
+        ]
+
+    problems = []
+
+    if not card.get("point"):
+        problems.append(
+            "empty point"
+        )
+
+    if card.get("source") not in allowed_ids:
+        problems.append(
+            f"unknown source: {card.get('source')}"
+        )
+
+    if card.get("importance") not in [
+        "high",
+        "medium"
+    ]:
+        problems.append(
+            "importance must be high or medium"
+        )
+
+    return problems
+
+
+def generate_flashcards(
+    topic,
+    retrieved_chunks,
+    flashcard_llm,
+    n_cards,
+    difficulty,
+    focus,
+    include_formulas,
+    include_examples
+):
+
+    prompt = build_flashcard_prompt(
+        topic=topic,
+        retrieved_chunks=retrieved_chunks,
+        n_cards=n_cards,
+        difficulty=difficulty,
+        focus=focus,
+        include_formulas=include_formulas,
+        include_examples=include_examples,
+    )
+
+    response = flashcard_llm.invoke(
+        prompt
+    )
+
+    try:
+
+        data = json.loads(
+            response.content
+        )
+
+    except json.JSONDecodeError:
+
+        return [], [
+            "The LLM did not return valid JSON."
+        ]
+
+    if (
+        not isinstance(data, dict)
+        or not isinstance(
+            data.get("flashcards"),
+            list
+        )
+    ):
+
+        return [], [
+            "The JSON does not contain a 'flashcards' list."
+        ]
+
+    allowed_ids = [
+        c["id"]
+        for c in retrieved_chunks
+    ]
+
+    valid_cards = []
+    reasons = []
+
+    for i, card in enumerate(
+        data["flashcards"],
+        start=1
+    ):
+
+        if isinstance(card, dict):
+
+            card["source"] = clean_source(
+                card.get("source")
+            )
+
+            card["point"] = (
+                str(card.get("point", ""))
+                .strip()
+            )
+
+        problems = check_flashcard(
+            card,
+            allowed_ids
+        )
+
+        # Check duplicate points
+        if not problems:
+
+            for old_card in valid_cards:
+
+                similarity = difflib.SequenceMatcher(
+                    None,
+                    card["point"].lower(),
+                    old_card["point"].lower()
+                ).ratio()
+
+                if similarity > 0.8:
+
+                    problems.append(
+                        "duplicate or very similar point"
+                    )
+
+                    break
+
+        if problems:
+
+            reasons.append(
+                f"Dropped flashcard {i}: {problems}"
+            )
+
+        else:
+
+            valid_cards.append(card)
+
+    return valid_cards, reasons
+
+
+def find_flashcard_source(
+    card,
+    retrieved_chunks
+):
+
+    for c in retrieved_chunks:
+
+        if c["id"] == card["source"]:
+            return c
+
+    return None
+
+
+def make_flashcards(
+    res,
+    flashcard_llm,
+    explain_llm=None
+):
+    """explain_llm is given when the topic was typed on this page
+    (not checked yet): then a topic outside the lectures gets no cards."""
+
+    topic = st.session_state.flashcard_topic
+
+    with st.spinner(
+        "Searching the lectures and creating your flashcards..."
+    ):
+
+        # Retrieve more content than normal explanation
+        retrieved_chunks = hybrid_search(
+            topic,
+            res,
+            alpha=ALPHA,
+            top_k=FLASHCARD_TOP_K
+        )
+
+        if explain_llm is not None:
+
+            try:
+                found = topic_in_lectures(topic, retrieved_chunks, explain_llm)
+            except Exception as e:
+                return [f"Flashcard generation failed: {e}"]
+
+            if not found:
+                st.session_state.flashcards = []
+                st.session_state.flashcard_chunks = []
+                return [NOT_IN_LECTURES_REASON]
+
+        # Clear the old cards: if this try fails, they must not
+        # stay on screen under the new topic
+        st.session_state.flashcards = []
+        st.session_state.flashcard_chunks = []
+
+        try:
+
+            cards, reasons = generate_flashcards(
+                topic=topic,
+                retrieved_chunks=retrieved_chunks,
+                flashcard_llm=flashcard_llm,
+                n_cards=st.session_state.flashcard_count,
+                difficulty=st.session_state.flashcard_difficulty,
+                focus=st.session_state.flashcard_focus,
+                include_formulas=st.session_state.flashcard_formulas,
+                include_examples=st.session_state.flashcard_examples,
+            )
+
+        except Exception as e:
+
+            cards = []
+            reasons = [
+                f"Flashcard generation failed: {e}"
+            ]
+
+    if not cards:
+
+        return reasons
+
+    st.session_state.flashcards = cards
+    st.session_state.flashcard_chunks = retrieved_chunks
+    st.session_state.flashcard_index = 0
+
+    return reasons
+
+
+def flashcard_source_text(
+    card,
+    chunks
+):
+
+    source = find_flashcard_source(
+        card,
+        chunks
+    )
+
+    if source is None:
+        return None
+
+    return source
+
+
+def show_flashcard():
+
+    cards = st.session_state.flashcards
+
+    if not cards:
+        return
+
+    index = st.session_state.flashcard_index
+
+    # Safety
+    if index < 0:
+        index = 0
+
+    if index >= len(cards):
+        index = len(cards) - 1
+
+    st.session_state.flashcard_index = index
+
+    card = cards[index]
+
+    # ---------------------------------------------------------------
+    # Progress
+    # ---------------------------------------------------------------
+
+    st.markdown(
+        f"<div style='text-align:center; font-size:15px; margin-bottom:10px;'>"
+        f"Flashcard <b>{index + 1}</b> of <b>{len(cards)}</b>"
+        f"</div>",
+        unsafe_allow_html=True
+    )
+
+    progress = (index + 1) / len(cards)
+
+    st.progress(progress)
+
+    # ---------------------------------------------------------------
+    # Key info card
+    # ---------------------------------------------------------------
+
+    importance = card.get(
+        "importance",
+        "medium"
+    )
+
+    badge_color = (
+        "#e8734a"
+        if importance == "high"
+        else "#8a8a8a"
+    )
+
+    st.markdown(
+        f"<div style='display:flex; justify-content:space-between; "
+        f"align-items:center; margin-top:20px; margin-bottom:8px;'>"
+        f"<span style='font-size:13px; opacity:0.7;'>KEY INFO</span>"
+        f"<span style='font-size:11px; font-weight:600; text-transform:uppercase; "
+        f"letter-spacing:0.03em; padding:3px 10px; border-radius:999px; "
+        f"color:white; background:{badge_color};'>{importance}</span>"
+        f"</div>",
+        unsafe_allow_html=True
+    )
+
+    with st.container(border=True):
+
+        st.markdown(
+            f"<div style='font-size:22px; font-weight:600; line-height:1.6;'>"
+            f"{html.escape(card['point'])}"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+
+    # ---------------------------------------------------------------
+    # Source
+    # ---------------------------------------------------------------
+
+    source = flashcard_source_text(
+        card,
+        st.session_state.flashcard_chunks
+    )
+
+    if source:
+
+        st.caption(
+            f"📖 Source: {source['lecture']} · "
+            f"p.{source['page']}"
+        )
+
+    # ---------------------------------------------------------------
+    # Navigation
+    # ---------------------------------------------------------------
+
+    st.markdown("")
+
+    col1, col2, col3 = st.columns(
+        [1, 1, 1]
+    )
+
+    with col1:
+
+        if st.button(
+            "← Previous",
+            disabled=(index == 0),
+            use_container_width=True
+        ):
+
+            st.session_state.flashcard_index -= 1
+            st.rerun()
+
+    with col2:
+
+        if st.button(
+            "🔀 Shuffle",
+            use_container_width=True
+        ):
+
+            import random
+
+            random.shuffle(
+                st.session_state.flashcards
+            )
+
+            st.session_state.flashcard_index = 0
+            st.rerun()
+
+    with col3:
+
+        if st.button(
+            "Next →",
+            disabled=(index == len(cards) - 1),
+            use_container_width=True
+        ):
+
+            st.session_state.flashcard_index += 1
+            st.rerun()
+
+
+def render_flashcards_page(
+    res,
+    flashcard_llm,
+    explain_llm,
+    n_lectures,
+    n_slides
+):
+
+    # ---------------------------------------------------------------
+    # Header
+    # ---------------------------------------------------------------
+
+    st.markdown(
+        """
+<div class="hero">
+
+  <div class="badge">
+    <span class="dot"></span>
+    Flashcards from your NTI lecture slides
+  </div>
+
+  <h1>
+    Study With <span class="hl">Flashcards</span>
+  </h1>
+
+  <p>
+    Choose exactly how you want your flashcards to be generated.
+    Every point comes straight from your lecture slides.
+  </p>
+
+</div>
+""",
+        unsafe_allow_html=True
+    )
+
+    # ---------------------------------------------------------------
+    # Settings
+    # ---------------------------------------------------------------
+
+    st.markdown("### ⚙️ Flashcard Settings")
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+
+        # A fixed key keeps what the student typed, even after a failed try
+        # (with value=..., the box was rebuilt and went back to the old topic)
+        if "flashcard_topic_input" not in st.session_state:
+            st.session_state.flashcard_topic_input = st.session_state.flashcard_topic
+
+        topic = st.text_input(
+            "Topic",
+            key="flashcard_topic_input",
+            placeholder="e.g. K-means clustering"
+        )
+
+        count = st.number_input(
+            "Number of flashcards",
+            min_value=1,
+            max_value=FLASHCARD_MAX_COUNT,
+            value=FLASHCARD_DEFAULT_COUNT,
+            step=1
+        )
+
+    with col2:
+
+        difficulty = st.selectbox(
+            "Difficulty",
+            [
+                "Easy",
+                "Medium",
+                "Hard",
+                "Mixed"
+            ],
+            index=3
+        )
+
+        focus = st.selectbox(
+            "Information focus",
+            [
+                "Core concepts only",
+                "Core + supporting concepts"
+            ]
+        )
+
+    with col3:
+
+        st.caption(
+            f"📚 {n_lectures} lectures · "
+            f"{n_slides} slides available"
+        )
+
+    st.markdown("#### Additional content")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+
+        include_formulas = st.checkbox(
+            "➗ Include formulas",
+            value=True
+        )
+
+    with col2:
+
+        include_examples = st.checkbox(
+            "💡 Include examples",
+            value=True
+        )
+
+    # ---------------------------------------------------------------
+    # Generate
+    # ---------------------------------------------------------------
+
+    if st.button(
+        "✨ Generate Flashcards",
+        type="primary",
+        use_container_width=True
+    ):
+
+        if not topic.strip():
+
+            st.warning(
+                "Please enter a topic first."
+            )
+
+        else:
+
+            st.session_state.flashcard_topic = topic.strip()
+            st.session_state.flashcard_count = int(count)
+            st.session_state.flashcard_difficulty = difficulty
+            st.session_state.flashcard_focus = focus
+            st.session_state.flashcard_formulas = include_formulas
+            st.session_state.flashcard_examples = include_examples
+
+            reasons = make_flashcards(
+                res,
+                flashcard_llm,
+                explain_llm
+            )
+
+            if reasons and st.session_state.flashcards:
+
+                with st.expander(
+                    "Generation details"
+                ):
+
+                    for reason in reasons:
+                        st.caption(reason)
+
+            if reasons == [NOT_IN_LECTURES_REASON]:
+
+                st.info(
+                    "This topic is not in the lectures, so there are no flashcards for it. "
+                    "Try a topic from the course."
+                )
+
+            elif not st.session_state.flashcards:
+
+                st.warning(
+                    "I couldn't create flashcards from the retrieved lecture content. "
+                    "Try a more specific topic."
+                )
+
+            else:
+
+                st.rerun()
+
+    # ---------------------------------------------------------------
+    # Existing flashcards
+    # ---------------------------------------------------------------
+
+    if st.session_state.flashcards:
+
+        st.divider()
+
+        col1, col2 = st.columns(
+            [3, 1]
+        )
+
+        with col1:
+
+            st.markdown(
+                f"### 📚 {st.session_state.flashcard_topic}"
+            )
+
+            st.caption(
+                f"{len(st.session_state.flashcards)} flashcards · "
+                f"{st.session_state.flashcard_difficulty}"
+            )
+
+        with col2:
+
+            if st.button(
+                "🗑️ Clear Cards",
+                use_container_width=True
+            ):
+
+                st.session_state.flashcards = []
+                st.session_state.flashcard_chunks = []
+                st.session_state.flashcard_index = 0
+                st.rerun()
+
+        show_flashcard()
+
+
+# =====================================================================
+# 5) UI helpers
+# =====================================================================
+
 def buddy_html():
-    # The picture is embedded as base64 (no file server needed); the "..." thinking bubble is HTML + CSS
-    image_bytes = (ASSETS_DIR / "study_buddy.webp").read_bytes()
-    encoded = base64.b64encode(image_bytes).decode()
-    return f"""<div class="buddy">
+
+    image_bytes = (
+        ASSETS_DIR / "study_buddy.webp"
+    ).read_bytes()
+
+    encoded = base64.b64encode(
+        image_bytes
+    ).decode()
+
+    return f"""
+<div class="buddy">
 <img src="data:image/webp;base64,{encoded}" alt="Study buddy">
-<div class="thinking"><span></span><span></span><span></span></div>
-</div>"""
+<div class="thinking">
+<span></span>
+<span></span>
+<span></span>
+</div>
+</div>
+"""
 
 
 def highlight_citations(answer):
-    # "[K-means p.21]" → "`K-means p.21`" so the CSS shows each citation as a small chip
-    return re.sub(r"\[([^\[\]]+? p\.\d+)\]", r"`\1`", answer)
+
+    return re.sub(
+        r"\[([^\[\]]+? p\.\d+)\]",
+        r"`\1`",
+        answer
+    )
 
 
-def top_bar(stage, n_lectures, n_slides):
-    explain_class = "seg active" if stage == "explain" else "seg"
-    quiz_class = "seg active" if stage == "quiz" else "seg"
-    st.markdown(f"""
-<div class="topbar">
-  <div class="brand"><span class="logo">AI</span><span>Study Assistant</span></div>
-  <div class="segments"><span class="{explain_class}">Explain</span><span class="{quiz_class}">Quiz</span></div>
-  <div class="chip">{n_lectures} lectures · {n_slides} slides</div>
-</div>""", unsafe_allow_html=True)
+def escape_dot_label(text):
+
+    return (
+        text
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+    )
 
 
-def task_card(title, lines, floating=False):
+def build_concept_graph_dot(edges):
+    """
+    Builds a DOT (graphviz) string for the session's concept map.
+    Rendered with st.graphviz_chart, which needs no extra install:
+    it draws the graph client-side from this text.
+    """
+
+    lines = [
+        "digraph G {",
+        "rankdir=LR;",
+        "bgcolor=transparent;",
+        "node [shape=box, style=\"rounded,filled\", "
+        "fillcolor=\"#eef2ff\", color=\"#6366f1\", "
+        "fontname=\"Helvetica\", fontsize=11];",
+        "edge [color=\"#9ca3af\"];",
+    ]
+
+    for parent, child in edges:
+
+        p = escape_dot_label(parent)
+        c = escape_dot_label(child)
+
+        lines.append(
+            f'"{p}" -> "{c}";'
+        )
+
+    lines.append("}")
+
+    return "\n".join(lines)
+
+
+def top_bar(
+    n_lectures,
+    n_slides
+):
+
+    st.markdown(
+        f"<div class='topbar'>"
+        f"<div class='brand'>"
+        f"<span class='logo'>AI</span>"
+        f"<span>Study Assistant</span>"
+        f"</div>"
+        f"<div class='chip'>{n_lectures} lectures · {n_slides} slides</div>"
+        f"</div>",
+        unsafe_allow_html=True
+    )
+
+
+def task_card(
+    title,
+    lines,
+    floating=False
+):
+
     body = "<br>".join(lines)
-    css_class = "task-card floating" if floating else "task-card"
-    st.markdown(f"""
+
+    css_class = (
+        "task-card floating"
+        if floating
+        else "task-card"
+    )
+
+    st.markdown(
+        f"""
 <div class="{css_class}">
-  <div class="task-title"><span>Task</span> {title}</div>
-  <div class="task-body">{body}</div>
-</div>""", unsafe_allow_html=True)
+  <div class="task-title">
+    <span>Task</span> {title}
+  </div>
+
+  <div class="task-body">
+    {body}
+  </div>
+</div>
+""",
+        unsafe_allow_html=True
+    )
 
 
 def show_sources(chunks):
-    with st.expander(f"📄 Slides used ({len(chunks)})"):
+
+    with st.expander(
+        f"📄 Slides used ({len(chunks)})"
+    ):
+
         for c in chunks:
-            st.markdown(f"**{c['lecture']} · p.{c['page']}**  <span class='score'>score {c['score']:.2f}</span>",
-                        unsafe_allow_html=True)
-            slide_text = c["text"].split("\n", 1)[-1]      # drop the "[Lecture]" line we added for retrieval
-            st.caption(slide_text[:500])
+
+            st.markdown(
+                f"""
+**{c['lecture']} · p.{c['page']}**
+<span class='score'>
+score {c['score']:.2f}
+</span>
+""",
+                unsafe_allow_html=True
+            )
+
+            slide_text = (
+                c["text"]
+                .split("\n", 1)[-1]
+            )
+
+            st.caption(
+                slide_text[:500]
+            )
 
 
-def question_title(number, q, mark=""):
-    # colored label: blue = single choice, purple = multiple choice
+def question_title(
+    number,
+    q,
+    mark=""
+):
+
     if q["type"] == "single":
-        badge = "<span class='qtype single'>Single choice · pick 1</span>"
+
+        badge = (
+            "<span class='qtype single'>"
+            "Single choice · pick 1"
+            "</span>"
+        )
+
     else:
-        badge = "<span class='qtype multiple'>Multi choice · select all that apply</span>"
-    st.markdown(f"<div class='qtitle'>{badge}<div>{mark} <b>Q{number}. {html.escape(q['question'])}</b></div></div>",
-                unsafe_allow_html=True)
+
+        badge = (
+            "<span class='qtype multiple'>"
+            "Multi choice · select all that apply"
+            "</span>"
+        )
+
+    st.markdown(
+        f"<div class='qtitle'>{badge}"
+        f"<div style='margin-top:10px;'>{mark} "
+        f"<b>Q{number}. {html.escape(q['question'])}</b>"
+        f"</div></div>",
+        unsafe_allow_html=True
+    )
 
 
-def option_row(letter, text, css_class, tag):
-    # html.escape: option text from the LLM may contain "<" or ">" (e.g. "x < 0")
-    tag_html = f"<span class='opt-tag'>{tag}</span>" if tag else ""
-    return f"<div class='opt {css_class}'><b>{letter}.</b> {html.escape(text)}{tag_html}</div>"
+def option_row(
+    letter,
+    text,
+    css_class,
+    tag
+):
+
+    tag_html = (
+        f"<span class='opt-tag'>{tag}</span>"
+        if tag
+        else ""
+    )
+
+    return (
+        f"<div class='opt {css_class}'>"
+        f"<b>{letter}.</b> "
+        f"{html.escape(text)}"
+        f"{tag_html}"
+        f"</div>"
+    )
 
 
-def show_answer_review(q, chosen):
-    """All 4 options: chosen + right = green, chosen + wrong = red, right but not chosen = green outline."""
+def show_answer_review(
+    q,
+    chosen
+):
+
     rows = []
+
     for letter, text in q["options"].items():
-        is_right = letter in q["answer"]
-        is_chosen = letter in chosen
+
+        is_right = (
+            letter in q["answer"]
+        )
+
+        is_chosen = (
+            letter in chosen
+        )
+
         if is_right and is_chosen:
-            rows.append(option_row(letter, text, "right", "✓ Your answer"))
+
+            rows.append(
+                option_row(
+                    letter,
+                    text,
+                    "right",
+                    "✓ Your answer"
+                )
+            )
+
         elif is_chosen:
-            rows.append(option_row(letter, text, "wrong", "✗ Your answer"))
+
+            rows.append(
+                option_row(
+                    letter,
+                    text,
+                    "wrong",
+                    "✗ Your answer"
+                )
+            )
+
         elif is_right:
-            rows.append(option_row(letter, text, "right missed", "✓ Correct answer"))
+
+            rows.append(
+                option_row(
+                    letter,
+                    text,
+                    "right missed",
+                    "✓ Correct answer"
+                )
+            )
+
         else:
-            rows.append(option_row(letter, text, "", ""))
-    st.markdown("".join(rows), unsafe_allow_html=True)
+
+            rows.append(
+                option_row(
+                    letter,
+                    text,
+                    "",
+                    ""
+                )
+            )
+
+    st.markdown(
+        "".join(rows),
+        unsafe_allow_html=True
+    )
 
 
-def make_new_quiz(res, quiz_llm):
-    """Generates a quiz from the saved slides (up to 2 tries). Returns the reasons if it failed."""
+def make_new_quiz_for_topic(
+    res,
+    quiz_llm
+):
+
     quiz = []
     all_reasons = []
-    with st.spinner("Writing questions from these slides..."):
-        # Try 2 only runs if try 1 gave fewer than N valid questions; its new questions fill the gaps
+
+    n_questions = st.session_state.quiz_count
+
+    with st.spinner(
+        "Writing questions from these slides..."
+    ):
+
         for attempt in [1, 2]:
-            avoid = list(st.session_state.previous_questions)
+
+            avoid = list(
+                st.session_state.quiz_previous_questions
+            )
+
             for q in quiz:
-                avoid.append(q["question"])
+
+                avoid.append(
+                    q["question"]
+                )
+
             try:
-                new_questions, reasons = generate_quiz(st.session_state.question, st.session_state.chunks, res,
-                                                       quiz_llm, avoid_questions=avoid)
+
+                new_questions, reasons = generate_quiz(
+                    st.session_state.quiz_topic,
+                    st.session_state.quiz_chunks,
+                    res,
+                    quiz_llm,
+                    n_questions=n_questions,
+                    avoid_questions=avoid
+                )
+
             except Exception as e:
-                new_questions, reasons = [], [f"Quiz generation failed: {e}"]
+
+                new_questions = []
+
+                reasons = [
+                    f"Quiz generation failed: {e}"
+                ]
+
             for reason in reasons:
-                all_reasons.append(f"Try {attempt}: {reason}")
-                print(f"Try {attempt}: {reason}")      # also in the terminal
+
+                all_reasons.append(
+                    f"Try {attempt}: {reason}"
+                )
+
+                print(
+                    f"Try {attempt}: {reason}"
+                )
+
             for q in new_questions:
-                if len(quiz) < N_QUIZ_QUESTIONS:
+
+                if len(quiz) < n_questions:
+
                     quiz.append(q)
-            if len(quiz) >= N_QUIZ_QUESTIONS:
+
+            if len(quiz) >= n_questions:
                 break
 
     if not quiz:
+
         return all_reasons
 
     for q in quiz:
-        st.session_state.previous_questions.append(q["question"])
+
+        st.session_state.quiz_previous_questions.append(
+            q["question"]
+        )
+
     st.session_state.quiz = quiz
-    st.session_state.quiz_round += 1            # new widget keys → no old answers carried over
-    st.session_state.submitted = False
-    st.session_state.chosen = {}
+    st.session_state.quiz_round += 1
+    st.session_state.quiz_submitted = False
+    st.session_state.quiz_chosen = {}
+
     return []
 
 
-def show_quiz_error(reasons):
-    st.warning("Could not generate a quiz this time. Please click again.")
-    with st.expander("Why? (details)"):
+def make_quiz(
+    res,
+    quiz_llm,
+    explain_llm=None
+):
+    """explain_llm is given when the topic was typed on this page
+    (not checked yet): then a topic outside the lectures gets no quiz."""
+
+    topic = st.session_state.quiz_topic
+
+    with st.spinner(
+        "Searching the lectures..."
+    ):
+
+        chunks = hybrid_search(
+            topic,
+            res,
+            alpha=ALPHA,
+            top_k=QUIZ_TOP_K
+        )
+
+        if explain_llm is not None:
+
+            try:
+                found = topic_in_lectures(topic, chunks, explain_llm)
+            except Exception as e:
+                return [f"Quiz generation failed: {e}"]
+
+            if not found:
+                st.session_state.quiz = []
+                st.session_state.quiz_chunks = []
+                st.session_state.quiz_submitted = False
+                return [NOT_IN_LECTURES_REASON]
+
+    # Clear the old quiz: if this one fails, the old questions must not
+    # stay on screen under the new topic
+    st.session_state.quiz = []
+    st.session_state.quiz_submitted = False
+    st.session_state.quiz_chunks = chunks
+    st.session_state.quiz_previous_questions = []
+
+    return make_new_quiz_for_topic(
+        res,
+        quiz_llm
+    )
+
+
+def show_quiz_error(
+    reasons
+):
+
+    st.warning(
+        "Could not generate a quiz this time. Please click again."
+    )
+
+    with st.expander(
+        "Why? (details)"
+    ):
+
         for reason in reasons:
             st.caption(reason)
 
 
-def find_chunk(chunk_id):
-    for c in st.session_state.chunks:
+def find_chunk_in(
+    chunks,
+    chunk_id
+):
+
+    for c in chunks:
+
         if c["id"] == chunk_id:
             return c
+
     return None
 
 
-# =====================================================================
-# 5) Page
-# =====================================================================
-css = (ASSETS_DIR / "style.css").read_text(encoding="utf-8")
-st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
+def render_quiz_page(
+    res,
+    quiz_llm,
+    explain_llm,
+    n_lectures,
+    n_slides
+):
 
-# ---------- Session state: what must survive the re-run after every click ----------
-if "question" not in st.session_state:
-    st.session_state.question = None       # the last question asked
-    st.session_state.answer = None         # the explanation
-    st.session_state.chunks = []           # retrieved slides → reused by the quiz
-    st.session_state.quiz = []             # generated questions
-    st.session_state.quiz_round = 0        # new number for every quiz → fresh widget keys
-    st.session_state.submitted = False
-    st.session_state.chosen = {}           # question index → chosen letters
-    st.session_state.timing = {}
-if "previous_questions" not in st.session_state:
-    st.session_state.previous_questions = []   # quiz questions already asked on this topic
+    # ---------------------------------------------------------------
+    # Header
+    # ---------------------------------------------------------------
 
-if not os.getenv("OPENAI_API_KEY"):
-    st.error("OPENAI_API_KEY was not found. Put it in a `.env` file next to app.py, then restart the app.")
-    st.stop()
+    st.markdown(
+        """
+        <div class="hero">
+          <div class="badge">
+            <span class="dot"></span>
+            Quizzes from your NTI lecture slides
+          </div>
 
-try:
-    res = load_resources()
-except Exception as e:
-    st.error(f"Could not load `rag_db/` or `question_bank.json`. Run the notebook first.\n\n{e}")
-    st.stop()
+          <h1>
+            Test Yourself With <span class="hl">Quizzes</span>
+          </h1>
 
-explain_llm, quiz_llm = load_llms()
+          <p>
+            Pick a topic and get multiple-choice questions,
+            written only from your lecture slides.
+          </p>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
-n_slides = len(res["stored_ids"])
-lectures = set()
-for meta in res["stored_metas"]:
-    lectures.add(meta["lecture"])
+    # ---------------------------------------------------------------
+    # Settings
+    # ---------------------------------------------------------------
 
-if st.session_state.quiz:
-    stage = "quiz"
-else:
-    stage = "explain"
-top_bar(stage, len(lectures), n_slides)
+    st.markdown("### ⚙️ Quiz Settings")
 
-# ---------- Input: typed question or an example button ----------
-typed_question = st.chat_input("Ask about a lecture topic (in English)...")
-new_question = typed_question
+    col1, col2 = st.columns(2)
 
-if st.session_state.question is None:
-    # ---------------- Home screen ----------------
-    st.markdown("""
-<div class="hero">
-  <div class="badge"><span class="dot"></span>Answers only from your NTI lecture slides</div>
-  <h1>Turn Your <span class="hl">Lectures</span> Into<br>Answers &amp; <span class="hl">Quizzes</span></h1>
-  <p>Explained from the slides, cited by page, then a quiz in the Huawei HCIA-AI exam style.</p>
-</div>""", unsafe_allow_html=True)
+    with col1:
 
-    background_ids = "  ·  ".join(res["stored_ids"][:60])
-    st.markdown(f"""
-<div class="stage">
-  <div class="code-rain">{background_ids}</div>
-  {buddy_html()}
-</div>""", unsafe_allow_html=True)
+        # A fixed key keeps what the student typed, even after a failed try
+        # (with value=..., the box was rebuilt and went back to the old topic)
+        if "quiz_topic_input" not in st.session_state:
+            st.session_state.quiz_topic_input = st.session_state.quiz_topic
 
-    st.markdown("<div class='try-label'>Try one:</div>", unsafe_allow_html=True)
-    # empty columns on both sides center the 3 example buttons
-    _, col1, col2, col3, _ = st.columns([0.6, 1, 1.7, 1.6, 0.4], gap="small")
-    for col, example in zip([col1, col2, col3], EXAMPLE_QUESTIONS):
-        if col.button(example):
-            new_question = example
+        topic = st.text_input(
+            "Topic",
+            key="quiz_topic_input",
+            placeholder="e.g. K-means clustering"
+        )
 
-    task_card("Ready", [f"{len(lectures)} lectures indexed", "Ask in English for the best results"], floating=True)
+    with col2:
 
-# ---------- A new question: search + explain, then reset the quiz ----------
-if new_question:
-    with st.spinner("Searching the slides and writing the explanation..."):
-        t0 = time.time()
-        chunks = hybrid_search(new_question, res)
-        t1 = time.time()
-        try:
-            answer = explain_llm.invoke(build_prompt(new_question, chunks)).content
-        except Exception as e:
-            answer = None
-            st.error(f"The LLM call failed: {e}")
-        t2 = time.time()
+        count = st.number_input(
+            "Number of questions",
+            min_value=1,
+            max_value=QUIZ_MAX_COUNT,
+            value=st.session_state.quiz_count,
+            step=1
+        )
 
-    if answer is not None:
-        st.session_state.question = new_question
-        st.session_state.answer = answer
-        st.session_state.chunks = chunks
-        st.session_state.quiz = []
-        st.session_state.previous_questions = []     # new topic → start fresh
-        st.session_state.submitted = False
-        st.session_state.chosen = {}
-        st.session_state.timing = {"search": t1 - t0, "answer": t2 - t1}
-        st.rerun()
+    if st.button(
+        "📝 Generate Quiz",
+        type="primary",
+        use_container_width=True
+    ):
 
-if st.session_state.question is not None:
-    # ---------------- Answer screen ----------------
-    left, right = st.columns([1, 2.3], gap="large")
+        if not topic.strip():
 
-    with left:
-        st.markdown(f"<div class='stage small'>{buddy_html()}</div>",
-                    unsafe_allow_html=True)
-        lecture_names = []
-        for c in st.session_state.chunks:
-            if c["lecture"] not in lecture_names:
-                lecture_names.append(c["lecture"])
-        not_found = is_not_in_lectures(st.session_state.answer)
-        if not_found:
-            task_card("Not in the lectures", ["Try a topic from the course", f"{len(lectures)} lectures indexed"])
-        elif stage == "quiz":
-            task_card("Quiz", [f"{len(st.session_state.quiz)} questions", "From: " + ", ".join(lecture_names)])
+            st.warning(
+                "Please enter a topic first."
+            )
+
         else:
-            task_card("Explain", [f"{len(st.session_state.chunks)} slides found", "From: " + ", ".join(lecture_names)])
 
-    with right:
-        st.markdown(f"<div class='question-bubble'>{html.escape(st.session_state.question)}</div>",
-                    unsafe_allow_html=True)
+            st.session_state.quiz_topic = topic.strip()
+            st.session_state.quiz_count = int(count)
 
-        with st.container(border=True):
-            st.markdown(highlight_citations(st.session_state.answer))
-            if not not_found:
-                show_sources(st.session_state.chunks)       # the closest slides were not used → don't show them
+            reasons = make_quiz(
+                res,
+                quiz_llm,
+                explain_llm
+            )
 
-        if not_found:
-            # No quiz: the quiz would come from slides that are not about this question
-            st.info("This topic is not in the lectures, so there is no quiz for it. Ask about a topic from the course.")
-        elif not st.session_state.quiz:
-            if st.button("📝 Quiz me on this", type="primary"):
-                reasons = make_new_quiz(res, quiz_llm)
-                if reasons:
-                    show_quiz_error(reasons)
-                else:
-                    st.rerun()
+            if reasons and st.session_state.quiz:
 
-        # ---------------- Quiz ----------------
-        if st.session_state.quiz and not st.session_state.submitted:
-            with st.form(f"quiz_{st.session_state.quiz_round}"):
-                st.markdown("#### 📝 Quiz")
-                for i, q in enumerate(st.session_state.quiz):
-                    key = f"r{st.session_state.quiz_round}_q{i}"
-                    question_title(i + 1, q)
+                with st.expander(
+                    "Generation details"
+                ):
 
-                    if q["type"] == "single":
-                        st.radio(
-                            "Choose one answer",
-                            options=list(q["options"].keys()),
-                            format_func=lambda letter, q=q: f"{letter}. {q['options'][letter]}",
-                            index=None,
-                            key=key,
-                            label_visibility="collapsed",
-                        )
-                    else:
-                        for letter, option_text in q["options"].items():
-                            st.checkbox(f"{letter}. {option_text}", key=f"{key}_{letter}")
+                    for reason in reasons:
+                        st.caption(reason)
 
-                submitted = st.form_submit_button("Submit answers", type="primary")
+            if reasons == [NOT_IN_LECTURES_REASON]:
 
-            if submitted:
-                chosen = {}
-                for i, q in enumerate(st.session_state.quiz):
-                    key = f"r{st.session_state.quiz_round}_q{i}"
-                    if q["type"] == "single":
-                        picked = st.session_state.get(key)
-                        if picked is None:
-                            chosen[i] = []
-                        else:
-                            chosen[i] = [picked]
-                    else:
-                        chosen[i] = []
-                        for letter in q["options"]:
-                            if st.session_state.get(f"{key}_{letter}"):
-                                chosen[i].append(letter)
-                st.session_state.chosen = chosen
-                st.session_state.submitted = True
+                st.info(
+                    "This topic is not in the lectures, so there is no quiz for it. "
+                    "Try a topic from the course."
+                )
+
+            elif not st.session_state.quiz:
+
+                st.warning(
+                    "I couldn't create a quiz from the retrieved lecture content. "
+                    "Try a more specific topic."
+                )
+
+            else:
+
                 st.rerun()
 
-        # ---------------- Results ----------------
-        if st.session_state.quiz and st.session_state.submitted:
-            quiz = st.session_state.quiz
-            score = 0
-            for i, q in enumerate(quiz):
-                if grade_answer(st.session_state.chosen[i], q["answer"]):
-                    score += 1
+    if not st.session_state.quiz:
 
-            st.markdown(f"<div class='score-card'>Score <b>{score} / {len(quiz)}</b></div>", unsafe_allow_html=True)
+        st.caption(
+            f"📚 {n_lectures} lectures · "
+            f"{n_slides} slides available"
+        )
 
-            for i, q in enumerate(quiz):
-                chosen = st.session_state.chosen[i]
-                is_correct = grade_answer(chosen, q["answer"])
-                with st.container(border=True):
-                    mark = "✅" if is_correct else "❌"
-                    question_title(i + 1, q, mark)
-                    if not chosen:
-                        st.caption("You did not answer this question.")
-                    show_answer_review(q, chosen)
-                    st.caption(q["explanation"])
+        return
+
+    st.divider()
+
+    # ---------------------------------------------------------------
+    # Quiz header + clear
+    # ---------------------------------------------------------------
+
+    col1, col2 = st.columns(
+        [3, 1]
+    )
+
+    with col1:
+
+        st.markdown(
+            f"### 📝 {st.session_state.quiz_topic}"
+        )
+
+        lecture_names = []
+
+        for c in st.session_state.quiz_chunks:
+
+            if c["lecture"] not in lecture_names:
+
+                lecture_names.append(
+                    c["lecture"]
+                )
+
+        st.caption(
+            f"{len(st.session_state.quiz)} questions · "
+            "From: " + ", ".join(lecture_names)
+        )
+
+    with col2:
+
+        if st.button(
+            "🗑️ Clear Quiz",
+            use_container_width=True
+        ):
+
+            st.session_state.quiz = []
+            st.session_state.quiz_chunks = []
+            st.session_state.quiz_submitted = False
+            st.session_state.quiz_chosen = {}
+            st.rerun()
+
+    # ---------------------------------------------------------------
+    # QUIZ
+    # ---------------------------------------------------------------
+
+    if not st.session_state.quiz_submitted:
+
+        with st.form(
+            f"quiz_{st.session_state.quiz_round}"
+        ):
+
+            st.markdown(
+                "#### 📝 Quiz"
+            )
+
+            for i, q in enumerate(
+                st.session_state.quiz
+            ):
+
+                key = (
+                    f"r{st.session_state.quiz_round}"
+                    f"_q{i}"
+                )
+
+                question_title(
+                    i + 1,
+                    q
+                )
+
+                if q["type"] == "single":
+
+                    st.radio(
+                        "Choose one answer",
+                        options=list(
+                            q["options"].keys()
+                        ),
+                        format_func=lambda letter, q=q:
+                            f"{letter}. {q['options'][letter]}",
+                        index=None,
+                        key=key,
+                        label_visibility="collapsed",
+                    )
+
+                else:
+
+                    for letter, option_text in q["options"].items():
+
+                        st.checkbox(
+                            f"{letter}. {option_text}",
+                            key=f"{key}_{letter}"
+                        )
+
+            submitted = st.form_submit_button(
+                "Submit answers",
+                type="primary"
+            )
+
+        if submitted:
+
+            chosen = {}
+
+            for i, q in enumerate(
+                st.session_state.quiz
+            ):
+
+                key = (
+                    f"r{st.session_state.quiz_round}"
+                    f"_q{i}"
+                )
+
+                if q["type"] == "single":
+
+                    picked = st.session_state.get(
+                        key
+                    )
+
+                    if picked is None:
+
+                        chosen[i] = []
+
+                    else:
+
+                        chosen[i] = [
+                            picked
+                        ]
+
+                else:
+
+                    chosen[i] = []
+
+                    for letter in q["options"]:
+
+                        if st.session_state.get(
+                            f"{key}_{letter}"
+                        ):
+
+                            chosen[i].append(
+                                letter
+                            )
+
+            st.session_state.quiz_chosen = chosen
+
+            st.session_state.quiz_submitted = True
+
+            st.rerun()
+
+    # ---------------------------------------------------------------
+    # RESULTS
+    # ---------------------------------------------------------------
+
+    if st.session_state.quiz_submitted:
+
+        quiz = st.session_state.quiz
+
+        score = 0
+
+        for i, q in enumerate(quiz):
+
+            if grade_answer(
+                st.session_state.quiz_chosen[i],
+                q["answer"]
+            ):
+
+                score += 1
+
+        st.markdown(
+            f"<div class='score-card'>Score <b>{score} / {len(quiz)}</b></div>",
+            unsafe_allow_html=True
+        )
+
+        for i, q in enumerate(quiz):
+
+            chosen = (
+                st.session_state.quiz_chosen[i]
+            )
+
+            is_correct = grade_answer(
+                chosen,
+                q["answer"]
+            )
+
+            with st.container(
+                border=True
+            ):
+
+                mark = (
+                    "✅"
+                    if is_correct
+                    else "❌"
+                )
+
+                question_title(
+                    i + 1,
+                    q,
+                    mark
+                )
+
+                if not chosen:
+
+                    st.caption(
+                        "You did not answer this question."
+                    )
+
+                show_answer_review(
+                    q,
+                    chosen
+                )
+
+                if st.session_state.quiz_show_explanations:
+
+                    st.caption(
+                        q["explanation"]
+                    )
 
                     if not is_correct:
-                        slide = find_chunk(q["source"])
+
+                        slide = find_chunk_in(
+                            st.session_state.quiz_chunks,
+                            q["source"]
+                        )
+
                         if slide is not None:
-                            with st.expander(f"📖 Review this slide: {slide['lecture']} p.{slide['page']}"):
-                                st.caption(slide["text"].split("\n", 1)[-1])
 
-            if st.button("🔄 New quiz on this topic"):
-                reasons = make_new_quiz(res, quiz_llm)
-                if reasons:
-                    show_quiz_error(reasons)
-                else:
-                    st.rerun()
+                            with st.expander(
+                                f"📖 Review this slide: "
+                                f"{slide['lecture']} "
+                                f"p.{slide['page']}"
+                            ):
 
-    timing = st.session_state.timing
-    st.markdown(
-        f"<div class='stats'>Search {timing.get('search', 0):.2f}s · Answer {timing.get('answer', 0):.2f}s</div>",
-        unsafe_allow_html=True,
+                                st.caption(
+                                    slide["text"]
+                                    .split("\n", 1)[-1]
+                                )
+
+        if st.button(
+            "🔄 New quiz on this topic"
+        ):
+
+            reasons = make_new_quiz_for_topic(
+                res,
+                quiz_llm
+            )
+
+            if reasons:
+
+                show_quiz_error(
+                    reasons
+                )
+
+            else:
+
+                st.rerun()
+
+
+# =====================================================================
+# 6) Page setup
+# =====================================================================
+
+css = (
+    ASSETS_DIR / "style.css"
+).read_text(
+    encoding="utf-8"
+)
+
+st.markdown(
+    f"<style>{css}</style>",
+    unsafe_allow_html=True
+)
+
+
+# =====================================================================
+# 7) Session state
+# =====================================================================
+
+if "question" not in st.session_state:
+
+    st.session_state.question = None
+    st.session_state.answer = None
+    st.session_state.chunks = []
+    st.session_state.timing = {}
+
+
+# ---------------- Related concepts / concept map state ----------------
+
+if "related_concepts" not in st.session_state:
+
+    st.session_state.related_concepts = []
+
+
+if "concept_edges" not in st.session_state:
+
+    st.session_state.concept_edges = []
+
+
+# ---------------- Sidebar page selector state ----------------
+# (has a key so buttons elsewhere in the app can switch the page
+# programmatically, e.g. "Quiz me on this" from the Explain screen)
+
+if "page_radio" not in st.session_state:
+
+    st.session_state.page_radio = "💡 Explain Topic"
+
+
+if "pending_page" not in st.session_state:
+
+    st.session_state.pending_page = None
+
+
+# ---------------- Quiz page state ----------------
+
+if "quiz_topic" not in st.session_state:
+
+    st.session_state.quiz_topic = ""
+
+
+if "quiz_count" not in st.session_state:
+
+    st.session_state.quiz_count = N_QUIZ_QUESTIONS
+
+
+if "quiz_chunks" not in st.session_state:
+
+    st.session_state.quiz_chunks = []
+
+
+if "quiz" not in st.session_state:
+
+    st.session_state.quiz = []
+
+
+if "quiz_round" not in st.session_state:
+
+    st.session_state.quiz_round = 0
+
+
+if "quiz_submitted" not in st.session_state:
+
+    st.session_state.quiz_submitted = False
+
+
+if "quiz_chosen" not in st.session_state:
+
+    st.session_state.quiz_chosen = {}
+
+
+if "quiz_previous_questions" not in st.session_state:
+
+    st.session_state.quiz_previous_questions = []
+
+
+if "quiz_show_explanations" not in st.session_state:
+
+    st.session_state.quiz_show_explanations = True
+
+
+# ---------------- Flashcard state ----------------
+
+if "flashcards" not in st.session_state:
+
+    st.session_state.flashcards = []
+
+
+if "flashcard_chunks" not in st.session_state:
+
+    st.session_state.flashcard_chunks = []
+
+
+if "flashcard_index" not in st.session_state:
+
+    st.session_state.flashcard_index = 0
+
+
+if "flashcard_topic" not in st.session_state:
+
+    st.session_state.flashcard_topic = ""
+
+
+if "flashcard_count" not in st.session_state:
+
+    st.session_state.flashcard_count = FLASHCARD_DEFAULT_COUNT
+
+
+if "flashcard_difficulty" not in st.session_state:
+
+    st.session_state.flashcard_difficulty = "Mixed"
+
+
+if "flashcard_focus" not in st.session_state:
+
+    st.session_state.flashcard_focus = (
+        "Core + supporting concepts"
     )
+
+
+if "flashcard_formulas" not in st.session_state:
+
+    st.session_state.flashcard_formulas = True
+
+
+if "flashcard_examples" not in st.session_state:
+
+    st.session_state.flashcard_examples = True
+
+
+# =====================================================================
+# 8) API key
+# =====================================================================
+
+if not os.getenv("OPENAI_API_KEY"):
+
+    st.error(
+        "OPENAI_API_KEY was not found. "
+        "Put it in a `.env` file next to app.py, "
+        "then restart the app."
+    )
+
+    st.stop()
+
+
+# =====================================================================
+# 9) Load resources
+# =====================================================================
+
+try:
+
+    res = load_resources()
+
+except Exception as e:
+
+    st.error(
+        "Could not load `rag_db/` or "
+        "`question_bank.json`. "
+        "Run the notebook first.\n\n"
+        f"{e}"
+    )
+
+    st.stop()
+
+
+explain_llm, quiz_llm, flashcard_llm, related_llm = load_llms()
+
+
+# =====================================================================
+# 10) Basic statistics
+# =====================================================================
+
+n_slides = len(
+    res["stored_ids"]
+)
+
+lectures = set()
+
+for meta in res["stored_metas"]:
+
+    lectures.add(
+        meta["lecture"]
+    )
+
+
+# =====================================================================
+# 11) Study Mode selector
+# =====================================================================
+
+st.sidebar.markdown(
+    "## 📚 Study Mode"
+)
+
+# Apply any page switch requested by a button elsewhere in the app
+# (must happen BEFORE the radio widget below is instantiated —
+# Streamlit forbids writing to a widget's key after that).
+
+if st.session_state.pending_page is not None:
+
+    st.session_state.page_radio = st.session_state.pending_page
+    st.session_state.pending_page = None
+
+page = st.sidebar.radio(
+    "Choose a mode",
+    [
+        "💡 Explain Topic",
+        "📝 Quiz",
+        "📚 Flashcards"
+    ],
+    label_visibility="collapsed",
+    key="page_radio"
+)
+
+if page == "📝 Quiz":
+
+    st.sidebar.markdown("---")
+
+    st.session_state.quiz_show_explanations = st.sidebar.checkbox(
+        "Show explanations after grading",
+        value=st.session_state.quiz_show_explanations,
+        help="Turn off to just see your score and which answers were right or wrong, without the explanation text."
+    )
+
+
+# =====================================================================
+# 12) QUIZ PAGE
+# =====================================================================
+
+if page == "📝 Quiz":
+
+    render_quiz_page(
+        res=res,
+        quiz_llm=quiz_llm,
+        explain_llm=explain_llm,
+        n_lectures=len(lectures),
+        n_slides=n_slides
+    )
+
+    # IMPORTANT:
+    # Stop here so Explain Topic does not also execute.
+    st.stop()
+
+
+# =====================================================================
+# 12b) FLASHCARD PAGE
+# =====================================================================
+
+if page == "📚 Flashcards":
+
+    render_flashcards_page(
+        res=res,
+        flashcard_llm=flashcard_llm,
+        explain_llm=explain_llm,
+        n_lectures=len(lectures),
+        n_slides=n_slides
+    )
+
+    # IMPORTANT:
+    # Stop here so Explain Topic does not also execute.
+    st.stop()
+
+
+# =====================================================================
+# 13) EXPLAIN TOPIC PAGE
+# =====================================================================
+
+
+top_bar(
+    len(lectures),
+    n_slides
+)
+
+
+# =====================================================================
+# 14) Input
+# =====================================================================
+
+typed_question = st.chat_input(
+    "Ask about a lecture topic (in English)..."
+)
+
+new_question = typed_question
+
+
+# =====================================================================
+# 15) Home screen
+# =====================================================================
+
+if st.session_state.question is None:
+
+    st.markdown(
+        """
+<div class="hero">
+
+  <div class="badge">
+    <span class="dot"></span>
+    Answers only from your NTI lecture slides
+  </div>
+
+  <h1>
+    Turn Your <span class="hl">Lectures</span> Into<br>
+    Clear <span class="hl">Answers</span>
+  </h1>
+
+  <p>
+    Explained from the slides, cited by page.
+    Head to the Quiz tab to test yourself after.
+  </p>
+
+</div>
+""",
+        unsafe_allow_html=True
+    )
+
+    background_ids = "  ·  ".join(
+        res["stored_ids"][:60]
+    )
+
+    st.markdown(
+        f"""
+<div class="stage">
+
+  <div class="code-rain">
+    {background_ids}
+  </div>
+
+  {buddy_html()}
+
+</div>
+""",
+        unsafe_allow_html=True
+    )
+
+    st.markdown(
+        "<div class='try-label'>Try one:</div>",
+        unsafe_allow_html=True
+    )
+
+    _, col1, col2, col3, _ = st.columns(
+        [
+            0.6,
+            1,
+            1.7,
+            1.6,
+            0.4
+        ],
+        gap="small"
+    )
+
+    for col, example in zip(
+        [col1, col2, col3],
+        EXAMPLE_QUESTIONS
+    ):
+
+        if col.button(example):
+
+            new_question = example
+
+    task_card(
+        "Ready",
+        [
+            f"{len(lectures)} lectures indexed",
+            "Ask in English for the best results"
+        ],
+        floating=True
+    )
+
+
+# =====================================================================
+# 16) New question
+# =====================================================================
+
+if new_question:
+
+    if answer_question(
+        new_question,
+        res,
+        explain_llm,
+        related_llm
+    ):
+
+        st.rerun()
+
+
+# =====================================================================
+# 17) Answer screen
+# =====================================================================
+
+if st.session_state.question is not None:
+
+    left, right = st.columns(
+        [1, 2.3],
+        gap="large"
+    )
+
+    # ---------------------------------------------------------------
+    # Left
+    # ---------------------------------------------------------------
+
+    with left:
+
+        st.markdown(
+            f"<div class='stage small'>{buddy_html()}</div>",
+            unsafe_allow_html=True
+        )
+
+        lecture_names = []
+
+        for c in st.session_state.chunks:
+
+            if c["lecture"] not in lecture_names:
+
+                lecture_names.append(
+                    c["lecture"]
+                )
+
+        not_found = is_not_in_lectures(
+            st.session_state.answer
+        )
+
+        if not_found:
+
+            task_card(
+                "Not in the lectures",
+                [
+                    "Try a topic from the course",
+                    f"{len(lectures)} lectures indexed"
+                ]
+            )
+
+        else:
+
+            task_card(
+                "Explain",
+                [
+                    f"{len(st.session_state.chunks)} slides found",
+                    "From: " + ", ".join(lecture_names)
+                ]
+            )
+
+    # ---------------------------------------------------------------
+    # Right
+    # ---------------------------------------------------------------
+
+    with right:
+
+        st.markdown(
+            f"""
+<div class='question-bubble'>
+    {html.escape(st.session_state.question)}
+</div>
+""",
+            unsafe_allow_html=True
+        )
+
+        with st.container(
+            border=True
+        ):
+
+            st.markdown(
+                highlight_citations(
+                    st.session_state.answer
+                )
+            )
+
+            if not not_found:
+
+                show_sources(
+                    st.session_state.chunks
+                )
+
+        # -----------------------------------------------------------
+        # No topic found
+        # -----------------------------------------------------------
+
+        if not_found:
+
+            st.info(
+                "This topic is not in the lectures. "
+                "Ask about a topic from the course."
+            )
+
+        else:
+
+            # ---------------------------------------------------
+            # Related concepts ("You may also want to learn")
+            # ---------------------------------------------------
+
+            if st.session_state.related_concepts:
+
+                st.markdown(
+                    "<div class='try-label'>"
+                    "🔎 You may also want to learn:"
+                    "</div>",
+                    unsafe_allow_html=True
+                )
+
+                concept_cols = st.columns(
+                    len(st.session_state.related_concepts)
+                )
+
+                for col, concept in zip(
+                    concept_cols,
+                    st.session_state.related_concepts
+                ):
+
+                    if col.button(
+                        f"→ {concept}",
+                        key=f"concept_{concept}",
+                        use_container_width=True
+                    ):
+
+                        if answer_question(
+                            concept,
+                            res,
+                            explain_llm,
+                            related_llm
+                        ):
+
+                            st.rerun()
+
+            # ---------------------------------------------------
+            # Jump straight into a quiz or flashcards on this
+            # same topic, using the question just asked.
+            # ---------------------------------------------------
+
+            st.markdown("")
+
+            qcol, fcol = st.columns(2)
+
+            with qcol:
+
+                if st.button(
+                    "📝 Quiz me on this",
+                    use_container_width=True
+                ):
+
+                    st.session_state.quiz_topic = (
+                        st.session_state.question
+                    )
+                    st.session_state.quiz_topic_input = (
+                        st.session_state.question
+                    )
+                    st.session_state.quiz_count = N_QUIZ_QUESTIONS
+
+                    reasons = make_quiz(
+                        res,
+                        quiz_llm
+                    )
+
+                    if not st.session_state.quiz:
+
+                        show_quiz_error(reasons)
+
+                    else:
+
+                        st.session_state.pending_page = "📝 Quiz"
+                        st.rerun()
+
+            with fcol:
+
+                if st.button(
+                    "📚 Flashcards on this",
+                    use_container_width=True
+                ):
+
+                    st.session_state.flashcard_topic = (
+                        st.session_state.question
+                    )
+                    st.session_state.flashcard_topic_input = (
+                        st.session_state.question
+                    )
+                    st.session_state.flashcard_count = (
+                        FLASHCARD_DEFAULT_COUNT
+                    )
+
+                    reasons = make_flashcards(
+                        res,
+                        flashcard_llm
+                    )
+
+                    if not st.session_state.flashcards:
+
+                        st.warning(
+                            "I couldn't create flashcards for this "
+                            "topic. Try asking about it differently."
+                        )
+
+                        with st.expander(
+                            "Why? (details)"
+                        ):
+
+                            for reason in reasons:
+                                st.caption(reason)
+
+                    else:
+
+                        st.session_state.pending_page = "📚 Flashcards"
+                        st.rerun()
+
+    # ---------------------------------------------------------------
+    # Timing
+    # ---------------------------------------------------------------
+
+    timing = (
+        st.session_state.timing
+    )
+
+    st.markdown(
+        f"""
+<div class='stats'>
+    Search {timing.get('search', 0):.2f}s
+    ·
+    Answer {timing.get('answer', 0):.2f}s
+</div>
+""",
+        unsafe_allow_html=True
+    )
+
+    # ---------------------------------------------------------------
+    # Concept map (session-wide, built from every topic the student
+    # asked about and the related concepts each one surfaced)
+    # ---------------------------------------------------------------
+
+    if st.session_state.concept_edges:
+
+        with st.expander(
+            "🕸️ Concept Map (this session)"
+        ):
+
+            dot = build_concept_graph_dot(
+                st.session_state.concept_edges
+            )
+
+            st.graphviz_chart(
+                dot,
+                use_container_width=True
+            )
+
+            if st.button(
+                "Clear map"
+            ):
+
+                st.session_state.concept_edges = []
+                st.rerun()

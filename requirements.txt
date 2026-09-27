@@ -1,0 +1,19 @@
+# Versions used to build rag_db/ and run the app (Windows, Python 3.11).
+# chromadb must stay on this version: rag_db/ was created with it.
+
+# ---------- App (app.py) ----------
+streamlit==1.64.0
+chromadb==1.5.9
+sentence-transformers==6.1.0
+torch==2.14.0
+scikit-learn==1.9.1
+numpy==2.4.6
+langchain-openai==1.6.5
+python-dotenv==1.2.3
+
+# ---------- Notebook only (to rebuild the index and the evaluations) ----------
+pypdf==6.19.0
+python-docx==1.2.0
+pandas==3.0.6
+matplotlib==3.11.2
+ipykernel==6.30.1
