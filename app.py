@@ -281,6 +281,26 @@ def is_not_in_lectures(answer):
     )
 
 
+NOT_IN_LECTURES_REASON = "This topic is not in the lectures."
+
+
+def topic_in_lectures(
+    topic,
+    retrieved_chunks,
+    explain_llm
+):
+    # Same check as the Explain page: ask for the grounded explanation and
+    # see if the LLM says "I don't know based on the lectures."
+    answer = explain_llm.invoke(
+        build_prompt(
+            topic,
+            retrieved_chunks
+        )
+    ).content
+
+    return not is_not_in_lectures(answer)
+
+
 def build_prompt(
     query,
     retrieved_chunks
@@ -744,6 +764,21 @@ def check_question(
             "options must be exactly A, B, C, D"
         )
 
+    for letter, option_text in options.items():
+
+        if not isinstance(option_text, str) or not option_text.strip():
+
+            problems.append(
+                f"option {letter} must be non-empty text"
+            )
+
+    # The explanation is shown after Submit: a missing one would crash the page
+    if not isinstance(q.get("explanation"), str) or not q.get("explanation").strip():
+
+        problems.append(
+            "empty explanation"
+        )
+
     answer = q.get("answer")
 
     if not isinstance(answer, list) or len(answer) == 0:
@@ -1193,8 +1228,11 @@ def find_flashcard_source(
 
 def make_flashcards(
     res,
-    flashcard_llm
+    flashcard_llm,
+    explain_llm=None
 ):
+    """explain_llm is given when the topic was typed on this page
+    (not checked yet): then a topic outside the lectures gets no cards."""
 
     topic = st.session_state.flashcard_topic
 
@@ -1209,6 +1247,18 @@ def make_flashcards(
             alpha=ALPHA,
             top_k=FLASHCARD_TOP_K
         )
+
+        if explain_llm is not None:
+
+            try:
+                found = topic_in_lectures(topic, retrieved_chunks, explain_llm)
+            except Exception as e:
+                return [f"Flashcard generation failed: {e}"]
+
+            if not found:
+                st.session_state.flashcards = []
+                st.session_state.flashcard_chunks = []
+                return [NOT_IN_LECTURES_REASON]
 
         try:
 
@@ -1395,6 +1445,7 @@ def show_flashcard():
 def render_flashcards_page(
     res,
     flashcard_llm,
+    explain_llm,
     n_lectures,
     n_slides
 ):
@@ -1436,9 +1487,14 @@ def render_flashcards_page(
 
     with col1:
 
+        # A fixed key keeps what the student typed, even after a failed try
+        # (with value=..., the box was rebuilt and went back to the old topic)
+        if "flashcard_topic_input" not in st.session_state:
+            st.session_state.flashcard_topic_input = st.session_state.flashcard_topic
+
         topic = st.text_input(
             "Topic",
-            value=st.session_state.flashcard_topic,
+            key="flashcard_topic_input",
             placeholder="e.g. K-means clustering"
         )
 
@@ -1523,7 +1579,8 @@ def render_flashcards_page(
 
             reasons = make_flashcards(
                 res,
-                flashcard_llm
+                flashcard_llm,
+                explain_llm
             )
 
             if reasons and st.session_state.flashcards:
@@ -1535,7 +1592,14 @@ def render_flashcards_page(
                     for reason in reasons:
                         st.caption(reason)
 
-            if not st.session_state.flashcards:
+            if reasons == [NOT_IN_LECTURES_REASON]:
+
+                st.info(
+                    "This topic is not in the lectures, so there are no flashcards for it. "
+                    "Try a topic from the course."
+                )
+
+            elif not st.session_state.flashcards:
 
                 st.warning(
                     "I couldn't create flashcards from the retrieved lecture content. "
@@ -1938,8 +2002,11 @@ def make_new_quiz_for_topic(
 
 def make_quiz(
     res,
-    quiz_llm
+    quiz_llm,
+    explain_llm=None
 ):
+    """explain_llm is given when the topic was typed on this page
+    (not checked yet): then a topic outside the lectures gets no quiz."""
 
     topic = st.session_state.quiz_topic
 
@@ -1953,6 +2020,19 @@ def make_quiz(
             alpha=ALPHA,
             top_k=QUIZ_TOP_K
         )
+
+        if explain_llm is not None:
+
+            try:
+                found = topic_in_lectures(topic, chunks, explain_llm)
+            except Exception as e:
+                return [f"Quiz generation failed: {e}"]
+
+            if not found:
+                st.session_state.quiz = []
+                st.session_state.quiz_chunks = []
+                st.session_state.quiz_submitted = False
+                return [NOT_IN_LECTURES_REASON]
 
     st.session_state.quiz_chunks = chunks
     st.session_state.quiz_previous_questions = []
@@ -1995,6 +2075,7 @@ def find_chunk_in(
 def render_quiz_page(
     res,
     quiz_llm,
+    explain_llm,
     n_lectures,
     n_slides
 ):
@@ -2034,9 +2115,14 @@ def render_quiz_page(
 
     with col1:
 
+        # A fixed key keeps what the student typed, even after a failed try
+        # (with value=..., the box was rebuilt and went back to the old topic)
+        if "quiz_topic_input" not in st.session_state:
+            st.session_state.quiz_topic_input = st.session_state.quiz_topic
+
         topic = st.text_input(
             "Topic",
-            value=st.session_state.quiz_topic,
+            key="quiz_topic_input",
             placeholder="e.g. K-means clustering"
         )
 
@@ -2069,7 +2155,8 @@ def render_quiz_page(
 
             reasons = make_quiz(
                 res,
-                quiz_llm
+                quiz_llm,
+                explain_llm
             )
 
             if reasons and st.session_state.quiz:
@@ -2081,7 +2168,14 @@ def render_quiz_page(
                     for reason in reasons:
                         st.caption(reason)
 
-            if not st.session_state.quiz:
+            if reasons == [NOT_IN_LECTURES_REASON]:
+
+                st.info(
+                    "This topic is not in the lectures, so there is no quiz for it. "
+                    "Try a topic from the course."
+                )
+
+            elif not st.session_state.quiz:
 
                 st.warning(
                     "I couldn't create a quiz from the retrieved lecture content. "
@@ -2611,6 +2705,7 @@ if page == "📝 Quiz":
     render_quiz_page(
         res=res,
         quiz_llm=quiz_llm,
+        explain_llm=explain_llm,
         n_lectures=len(lectures),
         n_slides=n_slides
     )
@@ -2629,6 +2724,7 @@ if page == "📚 Flashcards":
     render_flashcards_page(
         res=res,
         flashcard_llm=flashcard_llm,
+        explain_llm=explain_llm,
         n_lectures=len(lectures),
         n_slides=n_slides
     )
@@ -2916,6 +3012,9 @@ if st.session_state.question is not None:
                     st.session_state.quiz_topic = (
                         st.session_state.question
                     )
+                    st.session_state.quiz_topic_input = (
+                        st.session_state.question
+                    )
                     st.session_state.quiz_count = N_QUIZ_QUESTIONS
 
                     reasons = make_quiz(
@@ -2940,6 +3039,9 @@ if st.session_state.question is not None:
                 ):
 
                     st.session_state.flashcard_topic = (
+                        st.session_state.question
+                    )
+                    st.session_state.flashcard_topic_input = (
                         st.session_state.question
                     )
                     st.session_state.flashcard_count = (
