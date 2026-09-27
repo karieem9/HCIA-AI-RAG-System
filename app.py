@@ -164,7 +164,14 @@ def load_llms():
         response_format={"type": "json_object"}
     )
 
-    return explain_llm, quiz_llm, flashcard_llm
+    related_llm = ChatOpenAI(
+        model=LLM_NAME,
+        temperature=0.3
+    ).bind(
+        response_format={"type": "json_object"}
+    )
+
+    return explain_llm, quiz_llm, flashcard_llm, related_llm
 
 
 # =====================================================================
@@ -310,6 +317,236 @@ Context:
 Question: {query}
 
 Answer:"""
+
+
+# =====================================================================
+# 2b) Related concepts ("You may also want to learn")
+# =====================================================================
+
+RELATED_CONCEPTS_JSON_FORMAT = """{
+  "concepts": ["...", "...", "..."]
+}"""
+
+MAX_RELATED_CONCEPTS = 5
+
+
+def build_related_concepts_prompt(
+    topic,
+    retrieved_chunks
+):
+
+    slide_parts = []
+
+    for c in retrieved_chunks:
+
+        slide_parts.append(
+            f"[{c['lecture']} p.{c['page']}]\n"
+            f"{c['text']}"
+        )
+
+    slides = "\n\n---\n\n".join(
+        slide_parts
+    )
+
+    return f"""You help a student decide what to study next in an AI / Machine Learning course.
+
+The student just asked about:
+{topic}
+
+These are the lecture slides used to answer that question:
+{slides}
+
+Using ONLY these slides, list up to {MAX_RELATED_CONCEPTS} other concepts, terms,
+or techniques that are mentioned or clearly implied in them, and that a student
+would naturally want to learn about next.
+
+Rules:
+1. Do NOT repeat "{topic}" itself, or reword it.
+2. Do NOT invent a concept that is not in the slides above.
+3. Each concept is a short name (2-4 words), not a sentence, not a question.
+4. If the slides genuinely do not suggest any other concept, return fewer items,
+   or an empty list.
+
+Return ONLY a JSON object in this format:
+
+{RELATED_CONCEPTS_JSON_FORMAT}"""
+
+
+def check_related_concept(
+    concept,
+    topic
+):
+
+    if not isinstance(concept, str):
+        return False
+
+    concept = concept.strip()
+
+    if not concept or len(concept) > 60:
+        return False
+
+    if concept.lower() == topic.strip().lower():
+        return False
+
+    return True
+
+
+def get_related_concepts(
+    topic,
+    retrieved_chunks,
+    related_llm,
+    n=MAX_RELATED_CONCEPTS
+):
+
+    prompt = build_related_concepts_prompt(
+        topic,
+        retrieved_chunks
+    )
+
+    response = related_llm.invoke(prompt)
+
+    try:
+
+        data = json.loads(
+            response.content
+        )
+
+    except json.JSONDecodeError:
+
+        return []
+
+    raw_concepts = (
+        data.get("concepts")
+        if isinstance(data, dict)
+        else None
+    )
+
+    if not isinstance(raw_concepts, list):
+        return []
+
+    seen = set()
+    concepts = []
+
+    for raw in raw_concepts:
+
+        if not check_related_concept(
+            raw,
+            topic
+        ):
+            continue
+
+        cleaned = raw.strip()
+        key = cleaned.lower()
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        concepts.append(cleaned)
+
+        if len(concepts) >= n:
+            break
+
+    return concepts
+
+
+# =====================================================================
+# 2c) Explain flow (search + answer + related concepts)
+# =====================================================================
+
+def answer_question(
+    question,
+    res,
+    explain_llm,
+    related_llm
+):
+    """
+    Runs the full Explain Topic flow for `question`: hybrid search,
+    grounded explanation, and (if the topic was found in the lectures)
+    related concepts. Updates st.session_state and returns True on
+    success, False if the LLM call failed (an error is already shown
+    to the user in that case).
+    """
+
+    with st.spinner(
+        "Searching the slides and writing the explanation..."
+    ):
+
+        t0 = time.time()
+
+        chunks = hybrid_search(
+            question,
+            res
+        )
+
+        t1 = time.time()
+
+        try:
+
+            answer = explain_llm.invoke(
+                build_prompt(
+                    question,
+                    chunks
+                )
+            ).content
+
+        except Exception as e:
+
+            st.error(
+                f"The LLM call failed: {e}"
+            )
+
+            return False
+
+        t2 = time.time()
+
+        related_concepts = []
+
+        if not is_not_in_lectures(answer):
+
+            try:
+
+                related_concepts = get_related_concepts(
+                    question,
+                    chunks,
+                    related_llm
+                )
+
+            except Exception:
+
+                # Related concepts are a bonus feature: never break
+                # the explain flow if this call fails.
+                related_concepts = []
+
+        t3 = time.time()
+
+    st.session_state.question = question
+    st.session_state.answer = answer
+    st.session_state.chunks = chunks
+    st.session_state.related_concepts = related_concepts
+
+    st.session_state.timing = {
+        "search": t1 - t0,
+        "answer": t2 - t1,
+        "related": t3 - t2
+    }
+
+    # ---- session-wide concept map: remember topic -> concept edges ----
+
+    for concept in related_concepts:
+
+        edge = (question, concept)
+
+        if edge not in st.session_state.concept_edges:
+
+            st.session_state.concept_edges.append(edge)
+
+    # Keep the map readable: only remember the most recent edges.
+    st.session_state.concept_edges = (
+        st.session_state.concept_edges[-40:]
+    )
+
+    return True
 
 
 # =====================================================================
@@ -1382,6 +1619,46 @@ def highlight_citations(answer):
     )
 
 
+def escape_dot_label(text):
+
+    return (
+        text
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+    )
+
+
+def build_concept_graph_dot(edges):
+    """
+    Builds a DOT (graphviz) string for the session's concept map.
+    Rendered with st.graphviz_chart, which needs no extra install:
+    it draws the graph client-side from this text.
+    """
+
+    lines = [
+        "digraph G {",
+        "rankdir=LR;",
+        "bgcolor=transparent;",
+        "node [shape=box, style=\"rounded,filled\", "
+        "fillcolor=\"#eef2ff\", color=\"#6366f1\", "
+        "fontname=\"Helvetica\", fontsize=11];",
+        "edge [color=\"#9ca3af\"];",
+    ]
+
+    for parent, child in edges:
+
+        p = escape_dot_label(parent)
+        c = escape_dot_label(child)
+
+        lines.append(
+            f'"{p}" -> "{c}";'
+        )
+
+    lines.append("}")
+
+    return "\n".join(lines)
+
+
 def top_bar(
     n_lectures,
     n_slides
@@ -2109,6 +2386,18 @@ if "question" not in st.session_state:
     st.session_state.timing = {}
 
 
+# ---------------- Related concepts / concept map state ----------------
+
+if "related_concepts" not in st.session_state:
+
+    st.session_state.related_concepts = []
+
+
+if "concept_edges" not in st.session_state:
+
+    st.session_state.concept_edges = []
+
+
 # ---------------- Sidebar page selector state ----------------
 # (has a key so buttons elsewhere in the app can switch the page
 # programmatically, e.g. "Quiz me on this" from the Explain screen)
@@ -2254,7 +2543,7 @@ except Exception as e:
     st.stop()
 
 
-explain_llm, quiz_llm, flashcard_llm = load_llms()
+explain_llm, quiz_llm, flashcard_llm, related_llm = load_llms()
 
 
 # =====================================================================
@@ -2461,56 +2750,12 @@ if st.session_state.question is None:
 
 if new_question:
 
-    with st.spinner(
-        "Searching the slides and writing the explanation..."
+    if answer_question(
+        new_question,
+        res,
+        explain_llm,
+        related_llm
     ):
-
-        t0 = time.time()
-
-        chunks = hybrid_search(
-            new_question,
-            res
-        )
-
-        t1 = time.time()
-
-        try:
-
-            answer = explain_llm.invoke(
-                build_prompt(
-                    new_question,
-                    chunks
-                )
-            ).content
-
-        except Exception as e:
-
-            answer = None
-
-            st.error(
-                f"The LLM call failed: {e}"
-            )
-
-        t2 = time.time()
-
-    if answer is not None:
-
-        st.session_state.question = (
-            new_question
-        )
-
-        st.session_state.answer = (
-            answer
-        )
-
-        st.session_state.chunks = (
-            chunks
-        )
-
-        st.session_state.timing = {
-            "search": t1 - t0,
-            "answer": t2 - t1
-        }
 
         st.rerun()
 
@@ -2616,6 +2861,43 @@ if st.session_state.question is not None:
         else:
 
             # ---------------------------------------------------
+            # Related concepts ("You may also want to learn")
+            # ---------------------------------------------------
+
+            if st.session_state.related_concepts:
+
+                st.markdown(
+                    "<div class='try-label'>"
+                    "🔎 You may also want to learn:"
+                    "</div>",
+                    unsafe_allow_html=True
+                )
+
+                concept_cols = st.columns(
+                    len(st.session_state.related_concepts)
+                )
+
+                for col, concept in zip(
+                    concept_cols,
+                    st.session_state.related_concepts
+                ):
+
+                    if col.button(
+                        f"→ {concept}",
+                        key=f"concept_{concept}",
+                        use_container_width=True
+                    ):
+
+                        if answer_question(
+                            concept,
+                            res,
+                            explain_llm,
+                            related_llm
+                        ):
+
+                            st.rerun()
+
+            # ---------------------------------------------------
             # Jump straight into a quiz or flashcards on this
             # same topic, using the question just asked.
             # ---------------------------------------------------
@@ -2706,3 +2988,30 @@ if st.session_state.question is not None:
 """,
         unsafe_allow_html=True
     )
+
+    # ---------------------------------------------------------------
+    # Concept map (session-wide, built from every topic the student
+    # asked about and the related concepts each one surfaced)
+    # ---------------------------------------------------------------
+
+    if st.session_state.concept_edges:
+
+        with st.expander(
+            "🕸️ Concept Map (this session)"
+        ):
+
+            dot = build_concept_graph_dot(
+                st.session_state.concept_edges
+            )
+
+            st.graphviz_chart(
+                dot,
+                use_container_width=True
+            )
+
+            if st.button(
+                "Clear map"
+            ):
+
+                st.session_state.concept_edges = []
+                st.rerun()
