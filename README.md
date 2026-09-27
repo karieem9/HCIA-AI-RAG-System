@@ -68,7 +68,7 @@ Steps 1–4 run **once** in the notebook. Steps 5–8 run **every time** the stu
 - `fix_spaced_letters`: pypdf sometimes splits words into letters (`Q U A N T I Z E D` → `QUANTIZED`).
 - Skip pages with fewer than 30 characters (empty or title-only) and exact duplicate pages.
 - **1,015 pages → 887 chunks** (100 empty, 28 duplicates removed).
-- **One slide = one chunk.** We first tried agentic chunking (the LLM decides where a chunk ends): it lost the page numbers and needed one LLM call per paragraph. The experiment is in the notebook appendix (`agentic_chunks.json`).
+- **One slide = one chunk.** We first tried agentic chunking (the LLM decides where a chunk ends): it lost the page numbers and needed one LLM call per paragraph. The experiment is in the notebook appendix.
 - The lecture name is added at the start of every chunk (`[K-means]\n...`), because many slides never say their topic.
 - The longest chunk is 370 tokens (average 96), under the 512-token limit of the embedding model, so no chunk is cut.
 
@@ -168,7 +168,6 @@ ChromaDB touches the files in `rag_db/` every time the app or the notebook opens
 ├── question_bank.json              130 exam questions (100 single, 30 multiple)
 ├── question_bank.docx / question_bank_answer_key.docx
 ├── bank_eval_results.json          results of evaluation 2
-├── agentic_chunks.json             agentic chunking experiment (not used)
 ├── lectures/                       22 lecture PDFs
 ├── excluded/                       2 removed PDFs
 ├── assets/                         CSS, images, evaluation charts
