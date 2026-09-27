@@ -279,6 +279,12 @@ def check_question(q, allowed_ids):
         options = {}
     if sorted(options.keys()) != ["A", "B", "C", "D"]:
         problems.append("options must be exactly A, B, C, D")
+    for letter, option_text in options.items():
+        if not isinstance(option_text, str) or not option_text.strip():
+            problems.append(f"option {letter} must be non-empty text")
+
+    if not isinstance(q.get("explanation"), str) or not q.get("explanation").strip():
+        problems.append("empty explanation")
 
     answer = q.get("answer")
     if not isinstance(answer, list) or len(answer) == 0:
