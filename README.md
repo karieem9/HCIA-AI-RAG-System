@@ -21,9 +21,9 @@ A Streamlit app with 3 modes in the sidebar:
 
 | Mode | What it does |
 | --- | --- |
-| 💡 **Explain Topic** | Finds the 3 closest slides and explains **only from them**, with citations like `[K-means p.21]`. Outside the lectures (e.g. "Who won the World Cup?") it answers *"I don't know based on the lectures."* |
-| 📝 **Quiz** | 1–10 multiple-choice questions (3 by default) in the Huawei HCIA-AI exam style, written from the 5 closest slides. Single and "select all that apply" questions, graded all-or-nothing like the real exam. "New quiz on this topic" avoids repeated questions. |
-| 📚 **Flashcards** | 1–30 key points (10 by default) from the 6 closest slides. Settings: difficulty, core vs core + supporting concepts, formulas, examples. Previous / Shuffle / Next. |
+|  **Explain Topic** | Finds the 3 closest slides and explains **only from them**, with citations like `[K-means p.21]`. Outside the lectures (e.g. "Who won the World Cup?") it answers *"I don't know based on the lectures."* |
+|  **Quiz** | 1–10 multiple-choice questions (3 by default) in the Huawei HCIA-AI exam style, written from the 5 closest slides. Single and "select all that apply" questions, graded all-or-nothing like the real exam. "New quiz on this topic" avoids repeated questions. |
+|  **Flashcards** | 1–30 key points (10 by default) from the 6 closest slides. Settings: difficulty, core vs core + supporting concepts, formulas, examples. Previous / Shuffle / Next. |
 
 Under every answer:
 
