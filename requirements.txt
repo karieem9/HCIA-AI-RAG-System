@@ -1,6 +1,10 @@
 # Versions used to build rag_db/ and run the app (Windows, Python 3.11).
 # chromadb must stay on this version: rag_db/ was created with it.
 
+# CPU-only torch: the app never uses a GPU, and on Linux (Streamlit Cloud) the default
+# torch pulls several GB of CUDA libraries. Same version as before on Windows.
+--extra-index-url https://download.pytorch.org/whl/cpu
+
 # ---------- App (app.py) ----------
 streamlit==1.64.0
 chromadb==1.5.9

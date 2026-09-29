@@ -146,7 +146,18 @@ Run `Study_Assistant_Pipeline.ipynb` only to rebuild the index or re-run the eva
 
 ### Dependencies
 
-See `requirements.txt`. Main ones: `streamlit`, `chromadb` (must stay on the pinned version: `rag_db/` was built with it), `sentence-transformers`, `torch`, `scikit-learn`, `langchain-openai`, `python-dotenv`. Notebook only: `pypdf`, `python-docx`, `pandas`, `matplotlib`.
+See `requirements.txt`. Main ones: `streamlit`, `chromadb` (must stay on the pinned version: `rag_db/` was built with it), `sentence-transformers`, `torch` (CPU-only build), `scikit-learn`, `langchain-openai`, `python-dotenv`. Notebook only: `pypdf`, `python-docx`, `pandas`, `matplotlib`.
+
+### Deploy on Streamlit Community Cloud
+
+1. On [share.streamlit.io](https://share.streamlit.io), create an app from this repo: branch `main`, main file `app.py`.
+2. In **Advanced settings**, choose Python **3.11** and add the secret:
+
+```toml
+OPENAI_API_KEY = "sk-..."
+```
+
+The app reads the key from the environment, so no code change is needed. The first start downloads the embedding model and takes about a minute.
 
 ### Note for the team: `rag_db/`
 
